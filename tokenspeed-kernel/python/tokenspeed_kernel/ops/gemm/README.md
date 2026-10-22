@@ -55,7 +55,8 @@ Online quantization supplies freshly allocated, aligned activations and scales.
 
 `mv` selects the registered small-row projection implementation. Its dispatcher
 and registry both use the `("gemm", "mv")` operation. The gfx950 row-CTA GEMV
-declares its minimum N and K through the shared shape traits.
+declares its minimum N and K through the shared shape traits, and takes more
+than one row only for measured shapes, through its `mnk_problem_filter`.
 
 On CDNA4, ordinary GEMM dispatch admits the measured single-row
 `[1,8192] @ [4608,8192].T` projection alongside the existing multirow cases.
