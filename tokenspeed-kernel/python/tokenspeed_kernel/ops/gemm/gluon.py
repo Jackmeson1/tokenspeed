@@ -73,6 +73,12 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_gfx950 as _rowcta_bf16_gemv_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        launch_gluon_gated_rowcta_bf16_gemv_gfx950 as _gated_rowcta_bf16_gemv_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        supports_gluon_gated_rowcta_bf16_gemv_gfx950 as _supports_gated_rowcta,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         launch_gluon_gemv_a16w16_gfx950 as _gemv_a16w16_impl,
     )
@@ -160,6 +166,43 @@ if platform.is_amd:
                 device=x.device,
             )
         return _rowcta_bf16_gemv_impl(x, weight, out)
+
+    def _gated_rowcta_bf16_gemv_filter(m: int, n: int, k: int) -> bool:
+        # Heads are 64 wide, so K fixes the head count.
+        return _supports_gated_rowcta(n, k, k // 64, 64)
+
+    @register_kernel(
+        "gemm",
+        "mv_weightless_rmsnorm_gated_sigmoid",
+        name="gluon_gated_rowcta_bf16_gemv_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    gate=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "m": frozenset({1}),
+            "mnk_problem_filter": frozenset({_gated_rowcta_bf16_gemv_filter}),
+            "head_dim": frozenset({64}),
+        },
+    )
+    def gluon_gated_rowcta_bf16_gemv_gfx950(
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        num_heads: int,
+        eps: float,
+    ) -> torch.Tensor:
+        """Dispatch one gated row of the measured shapes to the gfx950 GEMV."""
+        return _gated_rowcta_bf16_gemv_impl(x, gate, weight, out, num_heads, eps)
 
     @register_kernel(
         "gemm",

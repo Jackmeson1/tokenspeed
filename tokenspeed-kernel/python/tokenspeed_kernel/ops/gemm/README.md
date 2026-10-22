@@ -62,6 +62,11 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+`mv_weightless_rmsnorm_gated_sigmoid` normalizes, gates and projects one row
+through the `("gemm", "mv_weightless_rmsnorm_gated_sigmoid")` operation. A
+registered kernel serves it only where the separate gated norm and `mv` select
+the kernels it reproduces bit for bit; otherwise callers keep the two calls.
+
 ## Per-token/per-channel FP8
 
 Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
