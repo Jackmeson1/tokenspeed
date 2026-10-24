@@ -1758,6 +1758,19 @@ class ServerArgs:
                 f"{self.mapping.dense.tp_size!s}!",
             )
 
+        if (
+            self.all2all_backend == "deepep"
+            and self.deepep_mode == "normal"
+            and not self.enforce_eager
+        ):
+            # A decode graph captures the MoE's dispatch and combine. Only the
+            # low-latency legs replay; the normal dispatch reads its
+            # per-expert receive counts on the host, which a graph cannot
+            # capture (the prefill graph is off under DeepEP for the same
+            # reason).
+            self.enforce_eager = True
+            logger.info("CUDA graph is disabled under --deepep-mode normal")
+
     def resolve_numerics(self):
         """Fold the ``--numerics`` envelope into the individual switches.
 
@@ -1796,20 +1809,15 @@ class ServerArgs:
             self.enable_allreduce_fusion = False
             # The slot-order fold runs over the EP group inside the MoE leaf:
             # a K-split (MoE TP) down projection would need a second,
-            # rank-ordered fold after it, and DeepEP's all-to-all owns that
-            # exchange itself (and hands the leaf a NCCL group, not the EP
-            # device group the fold runs on).
+            # rank-ordered fold after it. Under --all2all-backend deepep the
+            # leaf must itself own the exchange and fold the routes in slot
+            # order: the MoE plan selects only a kernel declaring both traits
+            # and refuses the launch otherwise.
             if self.mapping.moe.tp_size != 1:
                 raise ValueError(
                     "--moe-combine-order slot needs MoE TP 1: a K-split down "
                     "projection would need a second, rank-ordered fold after "
                     f"the slot-order one (got --moe-tp-size {self.mapping.moe.tp_size})"
-                )
-            if self.all2all_backend == "deepep":
-                raise ValueError(
-                    "--moe-combine-order slot folds the routed outputs over the "
-                    "EP group inside the MoE leaf; --all2all-backend deepep "
-                    "performs that exchange itself and cannot be combined with it"
                 )
 
     def _resolve_rl_bitwise(self):

@@ -402,7 +402,9 @@ is decoding", so one extending rank moves the whole group to the normal legs.
 
 When DeepEP is selected, TokenSpeed disables the prefill CUDA graph:
 normal-mode dispatch reports its per-expert receive counts to the host, and a
-graph cannot capture a host sync. Decode graphs are unaffected.
+graph cannot capture a host sync. Decode graphs replay the low-latency legs;
+`--deepep-mode normal` has none to replay, so it disables CUDA graphs
+altogether.
 
 For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
 metadata in DeepEP's required contiguous int64/float32 formats across both
