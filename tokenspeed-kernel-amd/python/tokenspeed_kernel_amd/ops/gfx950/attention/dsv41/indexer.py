@@ -87,107 +87,6 @@ def _csa2_page_rows(
     return gl.where(valid, physical, 0), logical % PAGE_SIZE, valid
 
 
-@gluon.jit
-def _score_csa2_group(
-    query,
-    query_scales,
-    head_weights,
-    index_k_cache,
-    page_table,
-    candidates,
-    token,
-    tile_start,
-    candidate_end,
-    table_stride,
-    cand_stride,
-    page_stride_bytes,
-    num_pages,
-    visible,
-    mfma_layout: gl.constexpr,
-    dot_b_layout: gl.constexpr,
-    b_scale_layout: gl.constexpr,
-    PAGE_SIZE: gl.constexpr,
-    table_width,
-    CANDIDATES: gl.constexpr,
-):
-    packed_dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, dot_b_layout))[
-        :, None
-    ]
-    columns = gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
-    positions = tile_start + columns
-    valid = positions < candidate_end
-    pages, page_rows, valid = _csa2_page_rows(
-        positions,
-        valid,
-        page_table,
-        candidates,
-        token,
-        table_stride,
-        cand_stride,
-        num_pages,
-        visible,
-        PAGE_SIZE,
-        table_width,
-        CANDIDATES,
-    )
-    key_offsets = (
-        pages * page_stride_bytes + page_rows.to(gl.int64) * _PACKED_DIM + packed_dims
-    )
-    key = gl.load(index_k_cache + key_offsets, mask=valid, other=0)
-
-    scale_columns = gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[
-        :, None
-    ]
-    scale_groups = gl.arange(0, _SCALE_DIM, layout=gl.SliceLayout(0, b_scale_layout))[
-        None, :
-    ]
-    scale_positions = tile_start + scale_columns
-    scale_valid = scale_positions < candidate_end
-    scale_pages, scale_page_rows, scale_valid = _csa2_page_rows(
-        scale_positions,
-        scale_valid,
-        page_table,
-        candidates,
-        token,
-        table_stride,
-        cand_stride,
-        num_pages,
-        visible,
-        PAGE_SIZE,
-        table_width,
-        CANDIDATES,
-    )
-    key_scale_offsets = (
-        scale_pages * page_stride_bytes
-        + PAGE_SIZE * _PACKED_DIM
-        + scale_page_rows.to(gl.int64) * _SCALE_DIM
-        + scale_groups
-    )
-    key_scales = gl.load(
-        index_k_cache + key_scale_offsets,
-        mask=scale_valid,
-        other=127,
-    )
-    accumulator = gl.zeros(
-        [_HEADS_PER_MFMA, _BLOCK_N], dtype=gl.float32, layout=mfma_layout
-    )
-    head_scores = gl.amd.cdna4.mfma_scaled(
-        a=query,
-        a_scale=query_scales,
-        a_format="e2m1",
-        b=key,
-        b_scale=key_scales,
-        b_format="e2m1",
-        acc=accumulator,
-    )
-    head_scores = gl.maximum(
-        head_scores,
-        0.0,
-        propagate_nan=tl.PropagateNan.ALL,
-    )
-    return gl.sum(head_scores * head_weights[:, None], axis=0)
-
-
 def _index_launch_metadata(grid, kernel, args):
     """Describe the score capacity without reading device-resident lengths."""
     queries, width = args["logits"].shape
@@ -204,17 +103,10 @@ def _index_launch_metadata(grid, kernel, args):
 @gluon.jit(
     launch_metadata=_index_launch_metadata,
     do_not_specialize=(
-        "stride_q_token",
-        "stride_q_head",
-        "stride_q_scale_token",
-        "stride_q_scale_head",
-        "stride_w_token",
-        "stride_w_head",
         "table_stride",
         "table_width",
         "cand_stride",
         "logits_stride",
-        "page_stride_bytes",
         "num_pages",
     ),
 )
@@ -261,10 +153,8 @@ def gluon_dsv41_index_topk_gfx950(
         width = CANDIDATES * 8
     else:
         width = vis
-    candidate_start = split * SCORE_CHUNK
-    candidate_end = gl.minimum(width, candidate_start + SCORE_CHUNK)
-    candidate_end = gl.minimum(candidate_end, max_candidates)
-    if candidate_start >= candidate_end:
+    scored_end = gl.minimum(width, max_candidates)
+    if split * SCORE_CHUNK >= scored_end:
         return
 
     layouts: gl.constexpr = _indexer_mfma_layouts(NUM_WARPS)
@@ -273,109 +163,170 @@ def gluon_dsv41_index_topk_gfx950(
     dot_b_layout: gl.constexpr = layouts[2]
     a_scale_layout: gl.constexpr = layouts[3]
     b_scale_layout: gl.constexpr = layouts[4]
-    query_0, query_scale_0, weight_0 = _load_query_group(
-        q,
-        q_scales,
-        weights,
-        token,
-        0,
-        stride_q_token,
-        stride_q_head,
-        stride_q_scale_token,
-        stride_q_scale_head,
-        stride_w_token,
-        stride_w_head,
-        mfma_layout,
-        dot_a_layout,
-        a_scale_layout,
+    query_0, query_scale_0, weight_0, query_1, query_scale_1, weight_1 = (
+        _qtile_load_queries(
+            q,
+            q_scales,
+            weights,
+            token,
+            stride_q_token,
+            stride_q_head,
+            stride_q_scale_token,
+            stride_q_scale_head,
+            stride_w_token,
+            stride_w_head,
+            mfma_layout,
+            dot_a_layout,
+            a_scale_layout,
+        )
     )
-    query_1, query_scale_1, weight_1 = _load_query_group(
-        q,
-        q_scales,
-        weights,
-        token,
-        16,
-        stride_q_token,
-        stride_q_head,
-        stride_q_scale_token,
-        stride_q_scale_head,
-        stride_w_token,
-        stride_w_head,
-        mfma_layout,
-        dot_a_layout,
-        a_scale_layout,
-    )
-    output_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
-    output_columns = gl.arange(0, BLOCK_N, layout=output_layout)
-    for tile_offset in range(0, CHUNK_N, BLOCK_N):
-        tile_start = candidate_start + tile_offset
-        scores = _score_csa2_group(
+    output_columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
+    table_row = page_table + token * table_stride
+    # The grid is bounded independently of the row capacity: CTA ``split``
+    # scores chunks split, split + splits, ... below the query's scored end.
+    for candidate_start in range(
+        split * SCORE_CHUNK, scored_end, gl.num_programs(1) * SCORE_CHUNK
+    ):
+        candidate_end = gl.minimum(scored_end, candidate_start + SCORE_CHUNK)
+        _score_token_chunk(
+            index_k_cache,
+            table_row,
+            candidates,
+            logits,
+            token,
+            candidate_start,
+            candidate_end,
+            cand_stride,
+            logits_stride,
+            page_stride_bytes,
+            num_pages,
+            vis,
+            table_width,
             query_0,
             query_scale_0,
             weight_0,
-            index_k_cache,
-            page_table,
-            candidates,
-            token,
-            tile_start,
-            candidate_end,
-            table_stride,
-            cand_stride,
-            page_stride_bytes,
-            num_pages,
-            vis,
-            mfma_layout,
-            dot_b_layout,
-            b_scale_layout,
-            PAGE_SIZE,
-            table_width,
-            CANDIDATES,
-        )
-        scores += _score_csa2_group(
             query_1,
             query_scale_1,
             weight_1,
+            output_columns,
+            CANDIDATES,
+            BLOCK_N,
+            CHUNK_N,
+            mfma_layout,
+            dot_b_layout,
+            b_scale_layout,
+        )
+
+
+@gluon.jit
+def _score_token_chunk(
+    index_k_cache,
+    table_row,
+    candidates,
+    logits,
+    token,
+    candidate_start,
+    candidate_end,
+    cand_stride,
+    logits_stride,
+    page_stride_bytes,
+    num_pages,
+    vis,
+    table_width,
+    query_0,
+    query_scale_0,
+    weight_0,
+    query_1,
+    query_scale_1,
+    weight_1,
+    output_columns,
+    CANDIDATES: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    CHUNK_N: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    dot_b_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+):
+    key, key_scales, live = _token_tile_keys(
+        index_k_cache,
+        table_row,
+        candidates,
+        token,
+        candidate_start,
+        candidate_end,
+        cand_stride,
+        page_stride_bytes,
+        num_pages,
+        vis,
+        table_width,
+        CANDIDATES,
+        mfma_layout,
+        dot_b_layout,
+        b_scale_layout,
+    )
+    key_1, key_scales_1, live_1 = _token_tile_keys(
+        index_k_cache,
+        table_row,
+        candidates,
+        token,
+        candidate_start + BLOCK_N,
+        candidate_end,
+        cand_stride,
+        page_stride_bytes,
+        num_pages,
+        vis,
+        table_width,
+        CANDIDATES,
+        mfma_layout,
+        dot_b_layout,
+        b_scale_layout,
+    )
+    for tile_offset in range(0, CHUNK_N, BLOCK_N):
+        tile_start = candidate_start + tile_offset
+        # Keep two key tiles in flight: each tile's loads wait on its page
+        # (and candidate) lookups. Both head groups share one key tile.
+        key_2, key_scales_2, live_2 = _token_tile_keys(
             index_k_cache,
-            page_table,
+            table_row,
             candidates,
             token,
-            tile_start,
+            tile_start + 2 * BLOCK_N,
             candidate_end,
-            table_stride,
             cand_stride,
             page_stride_bytes,
             num_pages,
             vis,
+            table_width,
+            CANDIDATES,
             mfma_layout,
             dot_b_layout,
             b_scale_layout,
-            PAGE_SIZE,
-            table_width,
-            CANDIDATES,
+        )
+        scores = _qtile_score(
+            query_0,
+            query_scale_0,
+            weight_0,
+            query_1,
+            query_scale_1,
+            weight_1,
+            key,
+            key_scales,
+            mfma_layout,
         )
         positions = tile_start + output_columns
-        bound = positions < candidate_end
-        _, _, live = _csa2_page_rows(
-            positions,
-            bound,
-            page_table,
-            candidates,
-            token,
-            table_stride,
-            cand_stride,
-            num_pages,
-            vis,
-            PAGE_SIZE,
-            table_width,
-            CANDIDATES,
-        )
         # Columns below the scored width that map to no row are written -inf,
         # so callers need not pre-fill the logits.
         gl.store(
             logits + token * logits_stride + positions,
             gl.where(live, scores, -float("inf")),
-            mask=bound,
+            mask=positions < candidate_end,
         )
+        key = key_1
+        key_scales = key_scales_1
+        live = live_1
+        key_1 = key_2
+        key_scales_1 = key_scales_2
+        live_1 = live_2
 
 
 @gluon.jit
@@ -514,6 +465,122 @@ def _qtile_store(logits, token, logits_stride, positions, bound, page_ok, scores
         gl.where(page_ok, scores, -float("inf")),
         mask=positions < bound,
     )
+
+
+@gluon.jit
+def _token_tile_keys(
+    cache,
+    table_row,
+    candidates,
+    token,
+    tile_start,
+    end,
+    cand_stride,
+    page_stride_bytes,
+    num_pages,
+    visible,
+    table_width,
+    CANDIDATES: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    dot_b_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+):
+    """One query's 32-column key tile, its scales, and its live columns."""
+    if CANDIDATES < 0:
+        key, key_scales, page_ok = _qtile_load_keys(
+            cache,
+            table_row,
+            tile_start,
+            end,
+            page_stride_bytes,
+            num_pages,
+            table_width,
+            dot_b_layout,
+            b_scale_layout,
+        )
+        columns = tile_start + gl.arange(
+            0, _BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+        )
+        live = (columns < end) & page_ok
+    else:
+        packed_dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, dot_b_layout))[
+            :, None
+        ]
+        columns = (
+            tile_start
+            + gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+        )
+        pages, page_rows, valid = _csa2_page_rows(
+            columns,
+            columns < end,
+            table_row,
+            candidates,
+            token,
+            0,
+            cand_stride,
+            num_pages,
+            visible,
+            64,
+            table_width,
+            CANDIDATES,
+        )
+        key = gl.load(
+            cache
+            + (pages * page_stride_bytes + page_rows.to(gl.int64) * _PACKED_DIM)
+            + packed_dims,
+            mask=valid,
+            other=0,
+        )
+        scale_columns = (
+            tile_start
+            + gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[:, None]
+        )
+        scale_groups = gl.arange(
+            0, _SCALE_DIM, layout=gl.SliceLayout(0, b_scale_layout)
+        )[None, :]
+        scale_pages, scale_rows, scale_valid = _csa2_page_rows(
+            scale_columns,
+            scale_columns < end,
+            table_row,
+            candidates,
+            token,
+            0,
+            cand_stride,
+            num_pages,
+            visible,
+            64,
+            table_width,
+            CANDIDATES,
+        )
+        key_scales = gl.load(
+            cache
+            + (
+                scale_pages * page_stride_bytes
+                + 64 * _PACKED_DIM
+                + scale_rows.to(gl.int64) * _SCALE_DIM
+            )
+            + scale_groups,
+            mask=scale_valid,
+            other=127,
+        )
+        out_columns = tile_start + gl.arange(
+            0, _BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+        )
+        _, _, live = _csa2_page_rows(
+            out_columns,
+            out_columns < end,
+            table_row,
+            candidates,
+            token,
+            0,
+            cand_stride,
+            num_pages,
+            visible,
+            64,
+            table_width,
+            CANDIDATES,
+        )
+    return key, key_scales, live
 
 
 def _qtile_launch_metadata(grid, kernel, args):
@@ -804,7 +871,14 @@ def dsv41_index_logits_gfx950(
             waves_per_eu=4,
         )
         return
-    gluon_dsv41_index_topk_gfx950[(queries, triton.cdiv(width, score_chunk_size))](
+    # A per-query CTA walks its chunk one key tile at a time; shorter chunks
+    # spread the dependent page and key loads over more CTAs.
+    score_chunk_size = min(score_chunk_size, 64 if queries <= 64 else 128)
+    chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
+    # Capacity-wide rows (decode tables) would launch mostly idle CTAs; cap
+    # the grid and let each CTA stride over chunks.
+    splits = min(triton.cdiv(width, score_chunk_size), max(16, 16384 // queries))
+    gluon_dsv41_index_topk_gfx950[(queries, splits)](
         values,
         scales.view(torch.uint8).reshape(queries, _MFMA_HEADS, scale_dim),
         w,
@@ -834,7 +908,7 @@ def dsv41_index_logits_gfx950(
         CHUNK_N=chunk_n,
         NUM_WARPS=2,
         num_warps=2,
-        waves_per_eu=2,
+        waves_per_eu=4,
     )
 
 

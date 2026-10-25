@@ -214,6 +214,9 @@ def test_indexer_score_chunk_bound(
     requested_chunk,
     score_chunk,
 ):
+    if arch == "gfx950":
+        # Few queries score in 64-row chunks, within the requested bound.
+        score_chunk = min(score_chunk, 64)
     hardware_chunk = (score_chunk + tile_n - 1) // tile_n * tile_n
     module = importlib.import_module(
         f"tokenspeed_kernel_amd.ops.{arch}.attention.dsv41.indexer"
