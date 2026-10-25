@@ -42,6 +42,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.indexer import (
 
 __all__ = [
     "dsv41_index_logits_gfx950",
+    "launch_gluon_dsv41_index_block_select_gfx950",
     "launch_gluon_dsv41_index_topk_select_gfx950",
 ]
 
@@ -1421,7 +1422,7 @@ def gluon_dsv41_index_topk_select_gfx950(
 
 
 def launch_gluon_dsv41_index_topk_select_gfx950(
-    logits, candidates, live_widths, topk, row_out, row_lens
+    logits, candidates, live_widths, topk, row_out, row_lens, take=None
 ):
     """Select CSA2 rows from scored logits, position-sorted.
 
@@ -1434,11 +1435,12 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
             that may be finite; row q's columns at or past ``live_widths[q]`` must be
             -inf and are not read. Full selection passes the visible lengths, so
             a page-table-capacity row costs its context, not its capacity.
-        topk: Selection capacity in [1, 1024]; V4.1 uses 512.
+        topk: Selection capacity in [1, 2048]; V4.1 uses 512.
         row_out: Int32 [Q, topk] destination. Row q receives the logical ids of
-            its ``min(topk, width)`` largest finite logits in ascending order,
+            its ``min(take, width)`` largest finite logits in ascending order,
             then -1 padding. Equal-score boundary ties keep the lowest columns.
         row_lens: Int32 [Q] destination for the number of ids written.
+        take: None for ``topk``, or the number of ids to select, <= topk.
 
     Returns:
         None.
@@ -1447,8 +1449,11 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
     if not queries:
         return
     topk = int(topk)
-    if not 1 <= topk <= 1024:
-        raise ValueError(f"select topk must be in [1, 1024], got {topk}")
+    if not 1 <= topk <= 2048:
+        raise ValueError(f"select topk must be in [1, 2048], got {topk}")
+    take = topk if take is None else int(take)
+    if not 0 <= take <= topk:
+        raise ValueError(f"select take must be in [0, {topk}], got {take}")
     if (
         logits.stride(1) != 1
         or row_out.stride(1) != 1
@@ -1484,7 +1489,7 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         0 if live_widths is None else live_widths.stride(0),
         width,
         topk,
-        min(topk, width),
+        min(take, width),
         TOPK=max(512, triton.next_power_of_2(topk)),
         HAS_CANDIDATES=candidates is not None,
         HAS_LIMITS=live_widths is not None,
@@ -1494,4 +1499,96 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         SEGMENT=256,
         VEC=width % 4 == 0,
         num_warps=_SELECT_WARPS,
+    )
+
+
+@gluon.jit(do_not_specialize=("out_stride", "n_cap", "visible_capacity"))
+def gluon_dsv41_index_block_max_gfx950(
+    logits,
+    visible,
+    block_max,
+    block_count,
+    logits_stride,
+    out_stride,
+    n_cap,
+    visible_capacity,
+    BLOCKS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Maxima of a row's visible 8-row blocks; the newest finite one is +inf."""
+    q = gl.program_id(0).to(gl.int64)
+    LB: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [NUM_WARPS, 1], [1, 0])
+    LO: gl.constexpr = gl.SliceLayout(1, LB)
+    seen = gl.minimum(
+        gl.maximum(gl.load(visible + q).to(gl.int64), 0), visible_capacity
+    ).to(gl.int32)
+    n = gl.minimum(n_cap, (seen + 7) // 8)
+    latest = gl.where(seen > 0, (seen - 1) // 8, -1)
+    if gl.program_id(1) == 0:
+        gl.store(block_count + q, n)
+    row = logits + q * logits_stride
+    lane = gl.arange(0, 8, layout=gl.SliceLayout(0, LB))[None, :]
+    for j0 in range(gl.program_id(1) * BLOCKS, n, gl.num_programs(1) * BLOCKS):
+        block = j0 + gl.arange(0, BLOCKS, layout=LO)
+        column = block[:, None] * 8 + lane
+        # Whole blocks load as vectors; columns past the visible rows are -inf.
+        x = gl.load(row + column, mask=block[:, None] < n, other=-float("inf"))
+        x = gl.max(gl.where(column < seen, x, -float("inf")), axis=1)
+        x = gl.where((block == latest) & (x > -float("inf")), float("inf"), x)
+        gl.store(block_max + q * out_stride + block, x, mask=block < n)
+
+
+def launch_gluon_dsv41_index_block_select_gfx950(
+    logits, visible, candidate_topk, block_out, block_lens, visible_capacity
+):
+    """Select each query's best 8-row blocks, position-sorted.
+
+    Has the ``index_block_select`` contract: block scores are 8-row block
+    maxima of the logits below ``visible[q]`` (clamped to
+    ``visible_capacity``), the block holding row ``visible[q] - 1`` is forced
+    in when it has a finite score, row q receives its
+    ``min(candidate_topk, width // 8)`` best block ids in ascending order and
+    then -1, and equal-score boundary ties keep the lowest blocks.
+    """
+    queries, width = logits.shape
+    if not queries:
+        return
+    k = min(int(candidate_topk), width // 8)
+    if k < 1:
+        block_out.fill_(-1)
+        block_lens.zero_()
+        return
+    if logits.stride(1) != 1 or block_out.stride(1) != 1:
+        raise ValueError("block select requires unit inner strides")
+    if queries > 1 and visible.stride(0) != 1:
+        raise ValueError("block select requires contiguous visible row counts")
+    blocks = width // 8
+    block_max = torch.empty(
+        (queries, blocks), dtype=torch.float32, device=logits.device
+    )
+    block_count = torch.empty(queries, dtype=torch.int32, device=logits.device)
+    per_cta = 256
+    gluon_dsv41_index_block_max_gfx950[
+        (queries, min(triton.cdiv(blocks, per_cta), max(1, 4096 // queries)))
+    ](
+        logits,
+        visible,
+        block_max,
+        block_count,
+        logits.stride(0),
+        block_max.stride(0),
+        blocks,
+        int(visible_capacity),
+        BLOCKS=per_cta,
+        NUM_WARPS=4,
+        num_warps=4,
+    )
+    launch_gluon_dsv41_index_topk_select_gfx950(
+        block_max,
+        None,
+        block_count,
+        block_out.shape[1],
+        block_out,
+        block_lens,
+        take=k,
     )
