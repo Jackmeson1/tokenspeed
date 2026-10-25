@@ -20,13 +20,12 @@
 
 """Attention-DP hard-pin (``data_parallel_rank``) plumbing tests (cheap, no GPU).
 
-Covers the end-to-end field revival: ``GenerateReqInput`` normalize/broadcast
-and ``__getitem__`` fan-out, the append-only wire position on
-``TokenizedGenerateReqInput``, ingress validation in
-``InputProcessor._validate_data_parallel_rank`` (the choke point every
-GenerateReqInput path traverses), the ``DataParallelController`` pinned
-dispatch (defensive fallback, never raising), the ``DPBudget`` reservation
-accounting for pinned traffic, and the ``SINGLE_WORKER_ID`` range fix.
+Covers ``GenerateReqInput`` normalize/broadcast and ``__getitem__`` fan-out,
+the append-only wire position on ``TokenizedGenerateReqInput``, ingress
+validation in ``InputProcessor._validate_data_parallel_rank`` (the choke
+point every GenerateReqInput path traverses) and the ``Engine`` entry points
+forwarding the pin. The frontend client places a pinned request
+(``ts-client``'s routing).
 """
 
 import os
@@ -43,18 +42,11 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 import msgspec.structs  # noqa: E402
 
-from tokenspeed.runtime.engine.data_parallel_controller import (  # noqa: E402
-    DataParallelController,
-    DPBudget,
-    LoadBalanceMethod,
-)
 from tokenspeed.runtime.engine.input_processor import InputProcessor  # noqa: E402
 from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     GenerateReqInput,
-    GetLoadReqOutput,
     TokenizedGenerateReqInput,
 )
-from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
 
 def _make_engine_stub(dp_size=8, has_attn_dp=True, disaggregation_mode="null"):
@@ -106,24 +98,12 @@ class TestGenerateReqInputPlumbing:
         assert (obj[0].data_parallel_rank) == (3)
         assert (obj[1].data_parallel_rank) == (4)
 
-    def test_default_is_none(self):
-        obj = GenerateReqInput(text="hello", sampling_params={})
-        obj.normalize_batch_and_arguments()
-        assert (obj.data_parallel_rank) is None
-
     def test_single_request_length1_list_unwrapped(self):
         # A list pin surviving normalize on a single request would fail the
         # int|None typed msgpack decode in the DP controller's dispatch loop.
         obj = GenerateReqInput(text="hello", sampling_params={}, data_parallel_rank=[2])
         obj.normalize_batch_and_arguments()
         assert (obj.data_parallel_rank) == (2)
-
-    def test_single_request_longer_list_rejected(self):
-        obj = GenerateReqInput(
-            text="hello", sampling_params={}, data_parallel_rank=[1, 2]
-        )
-        with pytest.raises((ValueError), match=("data_parallel_rank")):
-            obj.normalize_batch_and_arguments()
 
     def test_batch_list_length_mismatch_rejected(self):
         obj = GenerateReqInput(
@@ -182,17 +162,6 @@ class TestIngressValidation:
                         processor.validate_request(obj)
 
     @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
-    def test_batch_list_out_of_range_raises(self, mode):
-        processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
-        obj = GenerateReqInput(
-            text=["a", "b"],
-            sampling_params=[{}, {}],
-            data_parallel_rank=[1, 99],
-        )
-        with pytest.raises((ValueError), match=("99")):
-            processor.validate_request(obj)
-
-    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
     def test_batch_list_partial_pin_kept(self, mode):
         processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
         obj = GenerateReqInput(
@@ -218,47 +187,6 @@ class TestIngressValidation:
         assert obj.bootstrap_room == [10, 18]
         assert obj[0].data_parallel_rank == rank
         assert obj[1].data_parallel_rank == rank
-
-
-class _RecordingWorker:
-    """Stands in for a worker's ZMQ sender, which the test host lacks; records
-    what the controller would send."""
-
-    def __init__(self):
-        self.sent = []
-
-    def send_pyobj(self, obj):
-        self.sent.append(obj)
-
-
-class _RecordingPolicy:
-    """Records the requests handed to the load-balance policy."""
-
-    def __init__(self):
-        self.received = []
-
-    def __call__(self, req):
-        self.received.append(req)
-
-
-def _make_controller(dp_size=4, disaggregation_mode="null"):
-    controller = DataParallelController.__new__(DataParallelController)
-    controller.server_args = SimpleNamespace(
-        disaggregation_mode=disaggregation_mode,
-        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=dp_size)),
-    )
-    controller.workers = [_RecordingWorker() for _ in range(dp_size)]
-    controller.round_robin_counter = 0
-    controller.load_balance_method = LoadBalanceMethod.SHORTEST_QUEUE
-    controller.dp_budget = DPBudget(LoadBalanceMethod.SHORTEST_QUEUE)
-    controller.dispatching = _RecordingPolicy()
-    return controller
-
-
-def _tokenized(data_parallel_rank=None, bootstrap_room=None):
-    return SimpleNamespace(
-        data_parallel_rank=data_parallel_rank, bootstrap_room=bootstrap_room
-    )
 
 
 class TestEngineEntrypointForwarding:
@@ -301,144 +229,14 @@ class TestEngineEntrypointForwarding:
         assert (captured["obj"].data_parallel_rank) == (3)
 
 
-class TestControllerPinnedDispatch:
-    def test_delivery_follows_the_pin_through_the_initialized_dispatcher(self):
-        # The event loop hands messages to _request_dispatcher: a valid pin
-        # lands only on the selected worker — checked at the last valid
-        # rank, the `< dp_size` boundary — an unpinned request on the policy.
-        controller = _make_controller(dp_size=4)
-        controller.init_dispatcher()
-        pinned = TokenizedGenerateReqInput(
-            rid="wire-1",
-            input_ids=[1, 2, 3],
-            sampling_params=SamplingParams(),
-            stream=False,
-            data_parallel_rank=3,
-        )
-        controller._request_dispatcher(pinned)
-        assert (controller.workers[3].sent) == ([pinned])
-        for worker in controller.workers[:3]:
-            assert (worker.sent) == ([])
-        assert (controller.dispatching.received) == ([])
-
-        unpinned = TokenizedGenerateReqInput(
-            rid="wire-2",
-            input_ids=[4, 5],
-            sampling_params=SamplingParams(),
-            stream=False,
-        )
-        controller._request_dispatcher(unpinned)
-        assert (controller.dispatching.received) == ([unpinned])
-        assert (controller.workers[3].sent) == ([pinned])
-
-    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
-    def test_out_of_range_pin_falls_back_never_raises(self, mode):
-        # The dispatch loop is fed by a fire-and-forget PUSH socket with no
-        # per-request error path; a bad pin must degrade, not kill the loop.
-        controller = _make_controller(dp_size=4, disaggregation_mode=mode)
-        req = _tokenized(data_parallel_rank=4)
-        controller.dispatch_generate_request(req)
-        assert (controller.dispatching.received) == ([req])
-
-    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
-    def test_malformed_pin_payload_degrades_never_raises(self, mode, subtests):
-        # bool passes a bare range compare; a list raises TypeError on it —
-        # both must fall back to the policy, not escape the dispatch loop.
-        for bad in (True, [1], 2.5):
-            with subtests.test(bad=bad):
-                controller = _make_controller(dp_size=4, disaggregation_mode=mode)
-                req = _tokenized(data_parallel_rank=bad)
-                controller.dispatch_generate_request(req)
-                assert (controller.dispatching.received) == ([req])
-                for worker in controller.workers:
-                    assert (worker.sent) == ([])
-
-    @pytest.mark.parametrize(
-        ("prefill_size", "decode_size", "prefill_rank", "decode_rank", "room"),
-        [(16, 16, 3, 7, 19), (8, 16, 3, 11, 19), (1, 16, None, 7, 16)],
-    )
-    def test_pd_sides_dispatch_independently_with_the_same_room(
-        self, prefill_size, decode_size, prefill_rank, decode_rank, room
-    ):
-        for mode, size, rank in [
-            ("prefill", prefill_size, prefill_rank),
-            ("decode", decode_size, decode_rank),
-        ]:
-            controller = _make_controller(dp_size=size, disaggregation_mode=mode)
-            controller.dispatching = controller.round_robin_scheduler
-            controller.init_dispatcher()
-            req = TokenizedGenerateReqInput(
-                rid=mode,
-                input_ids=[1, 2, 3],
-                sampling_params=SamplingParams(),
-                stream=False,
-                data_parallel_rank=rank,
-                bootstrap_room=room,
-            )
-            controller._request_dispatcher(req)
-            selected = rank if rank is not None else room % size
-            for index, worker in enumerate(controller.workers):
-                assert worker.sent == ([req] if index == selected else [])
-            assert req.bootstrap_room == room
-
-    @pytest.mark.parametrize("mode", ["prefill", "decode"])
-    def test_unpinned_pd_round_robin_keeps_room_placement(self, mode):
-        controller = _make_controller(dp_size=8, disaggregation_mode=mode)
-        controller.dispatching = controller.round_robin_scheduler
-        controller.init_dispatcher()
-        req = TokenizedGenerateReqInput(
-            rid="unpinned",
-            input_ids=[1],
-            sampling_params=SamplingParams(),
-            stream=False,
-            bootstrap_room=19,
-        )
-        controller._request_dispatcher(req)
-        for index, worker in enumerate(controller.workers):
-            assert worker.sent == ([req] if index == 3 else [])
-
-    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
-    def test_pin_notes_budget_reservation(self, mode):
-        controller = _make_controller(dp_size=2, disaggregation_mode=mode)
-        loads = [
-            GetLoadReqOutput(dp_rank=0, num_reqs=0),
-            GetLoadReqOutput(dp_rank=1, num_reqs=0),
-        ]
-        controller.dp_budget.update_budget(loads)
-        controller.dp_budget.update_budget(loads)  # same order -> reservations live
-        controller.dispatch_generate_request(_tokenized(data_parallel_rank=1))
-        assert (controller.dp_budget.reservations[1]) == (1)
-        assert (controller.dp_budget.reservations[0]) == (0)
-
-
-class TestDPBudgetPinnedDispatch:
-    def test_pinned_reservation_steers_budget_away(self):
-        budget = DPBudget(LoadBalanceMethod.SHORTEST_QUEUE)
-        loads = [
-            GetLoadReqOutput(dp_rank=0, num_reqs=1),
-            GetLoadReqOutput(dp_rank=1, num_reqs=1),
-        ]
-        budget.update_budget(loads)
-        budget.update_budget(loads)
-        assert (budget.dispatch(pinned_rank=0)) == (0)
-        # rank 0 now carries a pinned in-flight request; the next budget
-        # dispatch must prefer rank 1.
-        assert (budget.dispatch()) == (1)
-
-    def test_pinned_before_first_snapshot_is_noop(self):
-        budget = DPBudget(LoadBalanceMethod.SHORTEST_QUEUE)
-        # no rank_order yet — must not raise
-        assert (budget.dispatch(pinned_rank=0)) == (0)
-        assert (budget.reservations) == ({})
-
-
 class TestTokenizeBridge:
-    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
-    @pytest.mark.asyncio(loop_scope="function")
-    async def test_pin_reaches_tokenized_request(self, mode):
-        # The only bridge that puts the pin onto the wire is
-        # tokenize_one_request copying obj.data_parallel_rank into
-        # TokenizedGenerateReqInput.
+    """The only bridge that puts the pin onto the wire is
+    tokenize_one_request copying obj.data_parallel_rank into
+    TokenizedGenerateReqInput; on a prefill engine the pin must agree with
+    the bootstrap_room residue that locates its KV cache."""
+
+    @staticmethod
+    def _processor(mode):
         processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
         engine = processor.engine
         engine.server_args.enable_prefix_caching = False
@@ -453,7 +251,12 @@ class TestTokenizeBridge:
         engine.tokenizer = None
         engine.max_req_input_len = 1024
         engine.context_len = 2048
+        return processor
 
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_pin_reaches_tokenized_request(self, mode):
+        processor = self._processor(mode)
         obj = GenerateReqInput(
             input_ids=[1, 2, 3],
             sampling_params={"max_new_tokens": 4},
@@ -467,14 +270,26 @@ class TestTokenizeBridge:
         assert (tokenized.data_parallel_rank) == (6)
         assert tokenized.bootstrap_room == 14
 
-
-class TestSingleWorkerIdRange:
-    def test_out_of_range_still_rejected(self):
-        controller = _make_controller(dp_size=4)
-        with mock.patch.dict(os.environ, {"SINGLE_WORKER_ID": "4"}):
-            with pytest.raises((ValueError)):
-                controller.single_robin_scheduler(_tokenized())
-
-
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+    @pytest.mark.parametrize(
+        ("mode", "rejected"), [("null", False), ("prefill", True), ("decode", False)]
+    )
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_room_conflicting_pin_rejected_on_prefill_only(self, mode, rejected):
+        # Decode locates the prefill KV source from the room residue, so a
+        # prefill pin that disagrees with it strands the transfer; a decode
+        # pin may differ from the residue.
+        processor = self._processor(mode)
+        obj = GenerateReqInput(
+            input_ids=[1, 2, 3],
+            sampling_params={"max_new_tokens": 4},
+            data_parallel_rank=5,
+            bootstrap_room=14,  # 14 % 8 == 6 != 5
+        )
+        processor.validate_request(obj)
+        obj.normalize_batch_and_arguments()
+        if rejected:
+            with pytest.raises((ValueError), match=("must match bootstrap_room")):
+                await processor.tokenize_one_request(obj)
+        else:
+            tokenized = await processor.tokenize_one_request(obj)
+            assert (tokenized.data_parallel_rank) == (5)

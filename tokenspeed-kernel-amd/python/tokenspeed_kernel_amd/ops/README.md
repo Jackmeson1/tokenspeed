@@ -126,6 +126,28 @@ independent weight streams in flight per CU, which suits cold weights.
   hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
   measured shapes route single rows to `mv` separately.
 
+### gfx950 FP32 router GEMV
+
+`gluon_fp32_router_gemv_gfx950` (`gemm/fp32/router_gemv.py`) computes
+`(x @ w.T) * multiplier` in FP32 for router decode batches, `1 <= M <= 16`,
+with one program per output. `gemm.fp32_router_gemv_plan` selects it on
+gfx950 and transposes the router weight once to `[N, K]`.
+
+#### Contract
+
+- `x` is a contiguous FP32 `[M, K]` matrix and `w` a contiguous FP32 `[N, K]`
+  matrix. `M > 16` or `K > 16384` takes `torch.matmul` and a multiply.
+- A row's logits are bitwise the same at every `M` the kernel serves.
+- One binary per (shape, multiplier, power-of-two M bucket); `M` is a runtime
+  argument.
+
+#### Algorithm
+
+A program stages its weight row in LDS with asynchronous `.cg` copies and
+keeps one FP32 FMA partial per row of `x`; one reduction across lanes and
+waves finishes the output. Every weight element is read once for all rows,
+and the summation order depends only on `K`.
+
 ### gfx950 dense BF16 decode GEMV
 
 `gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for
@@ -162,8 +184,9 @@ constexprs alone.
   128 bytes per lane each) takes the rest: more rows per wave, where it
   measured 1-8% faster, and shares that leave fewer than four ring chunks.
 - M = 2-16 (MFMA tile): a 16-row batched MFMA whose batch dimension is the
-  wave, so the four waves split every K iteration and reduce through LDS once;
-  weights load K-contiguous and reach the operand layout through LDS.
+  wave, so the waves split every K iteration and reduce through LDS once;
+  weights load K-contiguous and reach the operand layout through LDS. K >= 8192
+  uses eight waves instead of four.
 - Weight loads are streaming (`.cg`). K loops are unrolled: a loop-carried
   register copy of a pending load waits for the load and serializes the chunks.
 
@@ -780,6 +803,21 @@ and both scorers take queries packed as MXFP4 values with one E8M0 scale per
 32 values.
 
 #### Contract
+
+Visible lengths are bounded by the block table's row capacity in each consumer,
+before narrowing int64 inputs to int32. The adapter passes dense raw lengths
+without a separate clamp launch. Candidate-block selection uses the same table
+bound, including when compact candidate logits have a smaller width, so forcing
+the newest visible block preserves its logical position. Logit and histogram
+scratch initialization remains necessary for unscored columns and atomic sums.
+The gfx950 and gfx1250 row selectors read live-width strides directly, including
+broadcast limits and strided single-row tail tiles. Such tails retain their stride
+after PyTorch `contiguous()`, so selection cannot require a unit limit stride.
+Block selection suppresses scalar specialization only for the table bound.
+Its existing scalar arguments retain their alignment information: removing that
+information scalarizes vector score loads and regresses the measured Full
+candidate-source path. Widths and strides still arrive as runtime integers;
+model-fixed selection capacities retain the existing launch policy.
 
 - Queries have 1..32 index heads of dimension 128 from one local or
   replicated shard, with FP32 head weights. The index cache uses 64-row,
