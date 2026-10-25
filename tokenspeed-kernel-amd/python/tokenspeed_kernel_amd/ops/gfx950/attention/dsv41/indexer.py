@@ -1129,6 +1129,37 @@ def gluon_dsv41_index_topk_select_gfx950(
         row, width, take, hist_smem, ones, d, TOP, BLOCK, BINS, L, LBIN, VEC
     )
     count = above + remaining
+    FLAT: gl.constexpr = NUM_WARPS * REGION
+    FLAT_CAPACITY: gl.constexpr = FLAT - NUM_WARPS * SEGMENT
+    # Collect the keys whose bits from ``shift`` up are >= ``prefix``. When the
+    # pivot digit is too large to collect, refine it with the next digit.
+    prefix = pivot
+    shift = TOP
+    bin_size = pivot_size
+    above_bin = above
+    keep = remaining
+    if above + pivot_size > FLAT_CAPACITY:
+        prefix, above_bin, keep = _select_radix_pass(
+            row,
+            width,
+            take,
+            pivot,
+            above,
+            remaining,
+            hist_smem,
+            ones,
+            d,
+            LOW_BITS,
+            RADIX_BITS,
+            False,
+            BLOCK,
+            BINS,
+            L,
+            LBIN,
+        )
+        hist = hist_smem.load(LBIN)
+        bin_size = gl.sum(gl.where(d == (prefix & (BINS - 1)).to(gl.int32), hist, 0), 0)
+        shift = LOW_BITS
 
     # Collect: warp w scans columns [w * seg, (w + 1) * seg) in column order.
     # Lanes without a hit write the region's last SEGMENT slots.
@@ -1156,7 +1187,7 @@ def gluon_dsv41_index_topk_select_gfx950(
         values = gl.load(row + col, mask=group < end, other=-float("inf"))
         values = gl.where(col < end, values, -float("inf"))
         key = _select_order_key(values)
-        hit = (values > -float("inf")) & ((key >> TOP) >= pivot)
+        hit = (values > -float("inf")) & ((key >> shift) >= prefix)
         h = hit.to(gl.int32)
         slot = found[:, None] + gl.cumsum(h, 1) - h
         hit = hit & (slot < CAPACITY)
@@ -1164,7 +1195,32 @@ def gluon_dsv41_index_topk_select_gfx950(
         key_smem.scatter(key, slot, axis=1)
         col_smem.scatter(gl.where(hit, col, -1), slot, axis=1)
         found += gl.sum(h, 1)
+    total = gl.sum(found, 0)
     overflow = gl.max(found, 0) > CAPACITY
+    # A warp whose region overflowed: rewrite all collected keys contiguously
+    # at exact column-ordered offsets, unless they do not fit.
+    exact = overflow & (total <= FLAT_CAPACITY)
+    key_flat = key_smem.reshape([FLAT])
+    col_flat = col_smem.reshape([FLAT])
+    if exact:
+        written = gl.cumsum(found[:, None], 0) - found[:, None]
+        dump = FLAT - NUM_WARPS * SEGMENT + warp * SEGMENT + lane
+        gl.barrier()
+        for c0 in range(0, seg, SEGMENT):
+            col = start + c0 + lane
+            group = (start + c0 + (lane // 4) * 4) if VEC else col
+            values = gl.load(row + col, mask=group < end, other=-float("inf"))
+            values = gl.where(col < end, values, -float("inf"))
+            key = _select_order_key(values)
+            hit = (values > -float("inf")) & ((key >> shift) >= prefix)
+            h = hit.to(gl.int32)
+            slot = gl.reshape(
+                gl.where(hit, written + gl.cumsum(h, 1) - h, dump),
+                [NUM_WARPS * SEGMENT],
+            )
+            key_flat.scatter(gl.reshape(key, [NUM_WARPS * SEGMENT]), slot, axis=0)
+            col_flat.scatter(gl.reshape(col, [NUM_WARPS * SEGMENT]), slot, axis=0)
+            written += gl.sum(h, 1)[:, None]
     gl.barrier()
 
     picked_smem = gl.allocate_shared_memory(gl.int64, [2 * TOPK], SL)
@@ -1172,35 +1228,38 @@ def gluon_dsv41_index_topk_select_gfx950(
         [2 * TOPK // (64 * NUM_WARPS)], [64], [NUM_WARPS], [0]
     )
     out = row_out + q * out_stride
-    if not overflow:
+    in_lds = (overflow == 0) | exact
+    if in_lds:
         LF: gl.constexpr = gl.BlockedLayout([REGION // 64], [64], [NUM_WARPS], [0])
-        key = key_smem.reshape([NUM_WARPS * REGION]).load(LF)
-        col = col_smem.reshape([NUM_WARPS * REGION]).load(LF)
-        live = col >= 0
-        threshold = pivot << TOP
-        keep = remaining
-        if remaining < pivot_size:
-            # Resolve the K-th key inside the pivot digit.
+        key = key_flat.load(LF)
+        col = col_flat.load(LF)
+        # Regions mark free slots with column -1; the exact rewrite is dense.
+        live = gl.where(exact, gl.arange(0, FLAT, layout=LF) < total, col >= 0)
+        threshold = prefix << shift
+        if keep < bin_size:
+            # Resolve the K-th key inside the collected boundary bin.
             ones_f = gl.full([NUM_WARPS * REGION], 1, gl.int32, layout=LF)
-            prefix, above_f, keep = _select_lds_digit(
+            middle = prefix
+            if shift == TOP:
+                middle, _, keep = _select_lds_digit(
+                    key,
+                    live,
+                    prefix,
+                    0,
+                    keep,
+                    hist_smem,
+                    ones_f,
+                    d,
+                    LOW_BITS,
+                    RADIX_BITS,
+                    BINS,
+                    LBIN,
+                )
+            threshold, _, keep = _select_lds_digit(
                 key,
                 live,
-                pivot,
+                middle,
                 0,
-                remaining,
-                hist_smem,
-                ones_f,
-                d,
-                LOW_BITS,
-                RADIX_BITS,
-                BINS,
-                LBIN,
-            )
-            threshold, above_f, keep = _select_lds_digit(
-                key,
-                live,
-                prefix,
-                above_f,
                 keep,
                 hist_smem,
                 ones_f,
@@ -1213,7 +1272,7 @@ def gluon_dsv41_index_topk_select_gfx950(
             is_above = live & (key > threshold)
             is_tie = live & (key == threshold)
         else:
-            # The whole pivot digit is picked.
+            # The whole boundary bin is picked.
             is_above = live
             is_tie = col < -1
         tie = is_tie.to(gl.int32)
@@ -1320,7 +1379,7 @@ def gluon_dsv41_index_topk_select_gfx950(
     LR: gl.constexpr = gl.SliceLayout(1, LT)
     LC: gl.constexpr = gl.SliceLayout(0, LT)
     i = gl.arange(0, TOPK, layout=LR)
-    if HAS_CANDIDATES or overflow:
+    if HAS_CANDIDATES or not in_lds:
         # Rank sort of the picked ids: ids are unique, unpicked slots hold the
         # int64 max and rank after them.
         gl.barrier()
