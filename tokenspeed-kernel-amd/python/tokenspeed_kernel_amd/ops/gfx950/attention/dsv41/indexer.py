@@ -906,10 +906,84 @@ def _select_radix_pass(
     return prefix, above + higher, remaining - higher
 
 
+@gluon.jit
+def _select_top_digit_pass(
+    row,
+    width,
+    take,
+    hist_smem,
+    ones,
+    d,
+    SHIFT: gl.constexpr,
+    BLOCK: gl.constexpr,
+    BINS: gl.constexpr,
+    L: gl.constexpr,
+    LBIN: gl.constexpr,
+    VEC: gl.constexpr,
+):
+    """Histogram the top key digit of the live columns; return the pivot digit."""
+    hist_smem.store(gl.zeros([BINS], gl.int32, layout=LBIN))
+    lane = gl.arange(0, BLOCK, layout=L)
+    for c0 in range(0, width, BLOCK):
+        col = c0 + lane
+        # Masking whole 4-column groups keeps the load vectorized when the row
+        # capacity is a multiple of four; the tail is masked by value.
+        group = (c0 + (lane // 4) * 4) if VEC else col
+        values = gl.load(row + col, mask=group < width, other=-float("inf"))
+        values = gl.where(col < width, values, -float("inf"))
+        key = _select_order_key(values)
+        hist_smem.atomic_scatter_add(
+            ones,
+            (key >> SHIFT).to(gl.int32),
+            axis=0,
+            mask=values > -float("inf"),
+        )
+    hist = hist_smem.load(LBIN)
+    remaining = gl.minimum(take, gl.sum(hist, 0))
+    at_or_above = gl.cumsum(hist, 0, reverse=True)
+    pick = gl.maximum(gl.sum((at_or_above >= remaining).to(gl.int32), 0) - 1, 0)
+    higher = gl.sum(gl.where(d > pick, hist, 0), 0)
+    pivot_size = gl.sum(gl.where(d == pick, hist, 0), 0)
+    return pick.to(gl.uint32), higher, remaining - higher, pivot_size
+
+
+@gluon.jit
+def _select_lds_digit(
+    key,
+    live,
+    prefix,
+    above,
+    remaining,
+    hist_smem,
+    ones,
+    d,
+    SHIFT: gl.constexpr,
+    DIGIT_BITS: gl.constexpr,
+    BINS: gl.constexpr,
+    LBIN: gl.constexpr,
+):
+    """One MSD digit over register keys whose higher bits equal ``prefix``."""
+    gl.barrier()
+    hist_smem.store(gl.zeros([BINS], gl.int32, layout=LBIN))
+    gl.barrier()
+    match = live & ((key >> (SHIFT + DIGIT_BITS)) == prefix)
+    digit = ((key >> SHIFT) & ((1 << DIGIT_BITS) - 1)).to(gl.int32)
+    hist_smem.atomic_scatter_add(ones, digit, axis=0, mask=match)
+    gl.barrier()
+    hist = hist_smem.load(LBIN)
+    at_or_above = gl.cumsum(hist, 0, reverse=True)
+    pick = gl.maximum(gl.sum((at_or_above >= remaining).to(gl.int32), 0) - 1, 0)
+    higher = gl.sum(gl.where(d > pick, hist, 0), 0)
+    return (
+        (prefix << DIGIT_BITS) | pick.to(gl.uint32),
+        above + higher,
+        remaining - higher,
+    )
+
+
 @gluon.jit(
     launch_metadata=_select_launch_metadata,
     do_not_specialize=(
-        "logits_stride",
         "cand_stride",
         "out_stride",
         "row_limits_stride",
@@ -936,13 +1010,20 @@ def gluon_dsv41_index_topk_select_gfx950(
     HAS_LIMITS: gl.constexpr,
     RADIX_BITS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    REGION: gl.constexpr,  # LDS entries per warp, a power of two > SEGMENT
+    SEGMENT: gl.constexpr,  # columns per warp per step
+    VEC: gl.constexpr,  # the row capacity is a multiple of four columns
 ):
     """Top-``take`` finite logits of one query row as position-sorted ids.
 
-    A three-pass MSD radix select finds the order key of the K-th largest
-    finite logit (K = min(take, finite count)); a column-order compaction then
-    keeps every larger key plus the lowest-column ties, and an all-pairs rank
-    sorts the picked logical ids. Positions >= K are written as -1.
+    One pass histograms the top key digit and finds the pivot digit of the
+    K-th largest finite logit (K = min(take, finite count)). A second pass
+    lets each warp scan its own contiguous columns and append, in column
+    order, every key whose top digit is at least the pivot to its LDS region.
+    The regions in warp order are in column order, so the exact threshold,
+    the lowest-column boundary ties, and the output order follow from LDS
+    alone. A region overflow falls back to a three-pass MSD radix select
+    over the row. Positions >= K are written as -1.
     """
     BLOCK: gl.constexpr = 4 * 64 * NUM_WARPS
     BINS: gl.constexpr = 1 << RADIX_BITS
@@ -951,6 +1032,8 @@ def gluon_dsv41_index_topk_select_gfx950(
         [BINS // (64 * NUM_WARPS)], [64], [NUM_WARPS], [0]
     )
     SL: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    TOP: gl.constexpr = 32 - RADIX_BITS
+    LOW_BITS: gl.constexpr = 32 - 2 * RADIX_BITS
 
     q = gl.program_id(0).to(gl.int64)
     row = logits + q * logits_stride
@@ -963,126 +1046,220 @@ def gluon_dsv41_index_topk_select_gfx950(
     hist_smem = gl.allocate_shared_memory(gl.int32, [BINS], SL)
     ones = gl.full([BLOCK], 1, gl.int32, layout=L)
     d = gl.arange(0, BINS, layout=LBIN)
-
-    # MSD radix select: after each pass, ``prefix`` holds the fixed high bits
-    # of the K-th key, ``remaining`` its rank among keys sharing them and
-    # ``above`` the count of larger keys.
-    LOW_BITS: gl.constexpr = 32 - 2 * RADIX_BITS
-    prefix, above, remaining = _select_radix_pass(
-        row,
-        width,
-        take,
-        0,
-        0,
-        0,
-        hist_smem,
-        ones,
-        d,
-        32 - RADIX_BITS,
-        RADIX_BITS,
-        True,
-        BLOCK,
-        BINS,
-        L,
-        LBIN,
+    pivot, above, remaining, pivot_size = _select_top_digit_pass(
+        row, width, take, hist_smem, ones, d, TOP, BLOCK, BINS, L, LBIN, VEC
     )
-    prefix, above, remaining = _select_radix_pass(
-        row,
-        width,
-        take,
-        prefix,
-        above,
-        remaining,
-        hist_smem,
-        ones,
-        d,
-        LOW_BITS,
-        RADIX_BITS,
-        False,
-        BLOCK,
-        BINS,
-        L,
-        LBIN,
-    )
-    prefix, above, remaining = _select_radix_pass(
-        row,
-        width,
-        take,
-        prefix,
-        above,
-        remaining,
-        hist_smem,
-        ones,
-        d,
-        0,
-        LOW_BITS,
-        False,
-        BLOCK,
-        BINS,
-        L,
-        LBIN,
-    )
-    threshold = prefix
     count = above + remaining
 
-    # Column-order compaction: keys above the threshold plus the first
-    # ``remaining`` ties (equal-score ties may pick any equivalent subset).
+    # Collect: warp w scans columns [w * seg, (w + 1) * seg) in column order.
+    # Lanes without a hit write the region's last SEGMENT slots.
+    L2: gl.constexpr = gl.BlockedLayout(
+        [1, SEGMENT // 64], [1, 64], [NUM_WARPS, 1], [1, 0]
+    )
+    LI: gl.constexpr = gl.BlockedLayout(
+        [1, REGION // 64], [1, 64], [NUM_WARPS, 1], [1, 0]
+    )
+    SL2: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    CAPACITY: gl.constexpr = REGION - SEGMENT
+    key_smem = gl.allocate_shared_memory(gl.uint32, [NUM_WARPS, REGION], SL2)
+    col_smem = gl.allocate_shared_memory(gl.int32, [NUM_WARPS, REGION], SL2)
+    col_smem.store(gl.full([NUM_WARPS, REGION], -1, gl.int32, layout=LI))
+    gl.barrier()
+    seg = gl.cdiv(width, NUM_WARPS * SEGMENT) * SEGMENT
+    warp = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(1, L2))[:, None]
+    lane = gl.arange(0, SEGMENT, layout=gl.SliceLayout(0, L2))[None, :]
+    start = warp * seg
+    end = gl.minimum(start + seg, width)
+    found = gl.zeros([NUM_WARPS], gl.int32, layout=gl.SliceLayout(1, L2))
+    for c0 in range(0, seg, SEGMENT):
+        col = start + c0 + lane
+        group = (start + c0 + (lane // 4) * 4) if VEC else col
+        values = gl.load(row + col, mask=group < end, other=-float("inf"))
+        values = gl.where(col < end, values, -float("inf"))
+        key = _select_order_key(values)
+        hit = (values > -float("inf")) & ((key >> TOP) >= pivot)
+        h = hit.to(gl.int32)
+        slot = found[:, None] + gl.cumsum(h, 1) - h
+        hit = hit & (slot < CAPACITY)
+        slot = gl.where(hit, slot, CAPACITY + lane)
+        key_smem.scatter(key, slot, axis=1)
+        col_smem.scatter(gl.where(hit, col, -1), slot, axis=1)
+        found += gl.sum(h, 1)
+    overflow = gl.max(found, 0) > CAPACITY
+    gl.barrier()
+
     picked_smem = gl.allocate_shared_memory(gl.int64, [2 * TOPK], SL)
     LP: gl.constexpr = gl.BlockedLayout(
         [2 * TOPK // (64 * NUM_WARPS)], [64], [NUM_WARPS], [0]
     )
-    picked_smem.store(gl.full([2 * TOPK], 0x7FFFFFFFFFFFFFFF, gl.int64, layout=LP))
-    # One packed scan per chunk counts both: low 16 bits the keys above the
-    # threshold, high 16 bits the ties (a chunk holds fewer than 2**16).
-    n_above = 0
-    n_ties = 0
-    for c0 in range(0, width, BLOCK):
-        col = c0 + gl.arange(0, BLOCK, layout=L)
-        values = gl.load(row + col, mask=col < width, other=-float("inf"))
-        key = _select_order_key(values)
-        live = values > -float("inf")
-        is_above = live & (key > threshold)
-        is_tie = live & (key == threshold)
-        packed = is_above.to(gl.int32) | (is_tie.to(gl.int32) << 16)
-        before = gl.cumsum(packed, 0) - packed
-        ties_before = n_ties + (before >> 16)
-        take_it = is_above | (is_tie & (ties_before < remaining))
-        slot = n_above + (before & 0xFFFF) + gl.minimum(ties_before, remaining)
+    out = row_out + q * out_stride
+    if not overflow:
+        LF: gl.constexpr = gl.BlockedLayout([REGION // 64], [64], [NUM_WARPS], [0])
+        key = key_smem.reshape([NUM_WARPS * REGION]).load(LF)
+        col = col_smem.reshape([NUM_WARPS * REGION]).load(LF)
+        live = col >= 0
+        threshold = pivot << TOP
+        keep = remaining
+        if remaining < pivot_size:
+            # Resolve the K-th key inside the pivot digit.
+            ones_f = gl.full([NUM_WARPS * REGION], 1, gl.int32, layout=LF)
+            prefix, above_f, keep = _select_lds_digit(
+                key,
+                live,
+                pivot,
+                0,
+                remaining,
+                hist_smem,
+                ones_f,
+                d,
+                LOW_BITS,
+                RADIX_BITS,
+                BINS,
+                LBIN,
+            )
+            threshold, above_f, keep = _select_lds_digit(
+                key,
+                live,
+                prefix,
+                above_f,
+                keep,
+                hist_smem,
+                ones_f,
+                d,
+                0,
+                LOW_BITS,
+                BINS,
+                LBIN,
+            )
+            is_above = live & (key > threshold)
+            is_tie = live & (key == threshold)
+        else:
+            # The whole pivot digit is picked.
+            is_above = live
+            is_tie = col < -1
+        tie = is_tie.to(gl.int32)
+        pick = is_above | (is_tie & ((gl.cumsum(tie, 0) - tie) < keep))
+        picked = pick.to(gl.int32)
+        rank = gl.cumsum(picked, 0) - picked
         if HAS_CANDIDATES:
             block = gl.load(
-                candidates + q * cand_stride + col // 8, mask=take_it, other=-1
+                candidates + q * cand_stride + col // 8, mask=pick, other=-1
             ).to(gl.int64)
             logical = block * 8 + (col % 8).to(gl.int64)
+            picked_smem.store(
+                gl.full([2 * TOPK], 0x7FFFFFFFFFFFFFFF, gl.int64, layout=LP)
+            )
+            gl.barrier()
+            picked_smem.scatter(
+                logical,
+                gl.where(
+                    pick,
+                    rank,
+                    TOPK + gl.arange(0, NUM_WARPS * REGION, layout=LF) % TOPK,
+                ),
+                axis=0,
+            )
         else:
-            logical = col.to(gl.int64)
-        # Unpicked lanes write the scratch half [TOPK, 2*TOPK).
-        picked_smem.scatter(logical, gl.where(take_it, slot, TOPK + col % TOPK), axis=0)
-        total = gl.sum(packed, 0)
-        n_above += total & 0xFFFF
-        n_ties += total >> 16
+            gl.store(out + rank, col, mask=pick)
+    else:
+        # Fallback: three-pass MSD radix select over the row. After each pass,
+        # ``prefix`` holds the fixed high bits of the K-th key, ``remaining``
+        # its rank among keys sharing them and ``above`` the count of larger keys.
+        prefix = pivot
+        prefix, above, remaining = _select_radix_pass(
+            row,
+            width,
+            take,
+            prefix,
+            above,
+            remaining,
+            hist_smem,
+            ones,
+            d,
+            LOW_BITS,
+            RADIX_BITS,
+            False,
+            BLOCK,
+            BINS,
+            L,
+            LBIN,
+        )
+        prefix, above, remaining = _select_radix_pass(
+            row,
+            width,
+            take,
+            prefix,
+            above,
+            remaining,
+            hist_smem,
+            ones,
+            d,
+            0,
+            LOW_BITS,
+            False,
+            BLOCK,
+            BINS,
+            L,
+            LBIN,
+        )
+        threshold = prefix
+        # Column-order compaction: keys above the threshold plus the first
+        # ``remaining`` ties (equal-score ties may pick any equivalent subset).
+        picked_smem.store(gl.full([2 * TOPK], 0x7FFFFFFFFFFFFFFF, gl.int64, layout=LP))
+        # One packed scan per chunk counts both: low 16 bits the keys above the
+        # threshold, high 16 bits the ties (a chunk holds fewer than 2**16).
+        n_above = 0
+        n_ties = 0
+        for c0 in range(0, width, BLOCK):
+            col = c0 + gl.arange(0, BLOCK, layout=L)
+            values = gl.load(row + col, mask=col < width, other=-float("inf"))
+            key = _select_order_key(values)
+            live = values > -float("inf")
+            is_above = live & (key > threshold)
+            is_tie = live & (key == threshold)
+            packed = is_above.to(gl.int32) | (is_tie.to(gl.int32) << 16)
+            before = gl.cumsum(packed, 0) - packed
+            ties_before = n_ties + (before >> 16)
+            take_it = is_above | (is_tie & (ties_before < remaining))
+            slot = n_above + (before & 0xFFFF) + gl.minimum(ties_before, remaining)
+            if HAS_CANDIDATES:
+                block = gl.load(
+                    candidates + q * cand_stride + col // 8, mask=take_it, other=-1
+                ).to(gl.int64)
+                logical = block * 8 + (col % 8).to(gl.int64)
+            else:
+                logical = col.to(gl.int64)
+            # Unpicked lanes write the scratch half [TOPK, 2*TOPK).
+            picked_smem.scatter(
+                logical, gl.where(take_it, slot, TOPK + col % TOPK), axis=0
+            )
+            total = gl.sum(packed, 0)
+            n_above += total & 0xFFFF
+            n_ties += total >> 16
 
-    # Rank sort of the picked ids: ids are unique, unpicked slots hold the
-    # int64 max and rank after them.
     LT: gl.constexpr = gl.BlockedLayout([1, 64], [64, 1], [NUM_WARPS, 1], [1, 0])
     LR: gl.constexpr = gl.SliceLayout(1, LT)
     LC: gl.constexpr = gl.SliceLayout(0, LT)
-    mine = picked_smem.slice(0, TOPK).load(LR)
     i = gl.arange(0, TOPK, layout=LR)
-    rank = i
-    # Column order already is position order without candidates, and with
-    # candidate blocks listed in ascending order; sort only otherwise.
-    previous = gl.gather(mine, gl.maximum(i - 1, 0), axis=0)
-    descents = gl.sum(((i > 0) & (i < count) & (mine < previous)).to(gl.int32), 0)
-    if descents > 0:
-        rank = gl.zeros([TOPK], gl.int32, layout=LR)
-        for j0 in gl.static_range(0, TOPK, 64):
-            other = picked_smem.slice(j0, 64).load(LC)
-            rank += gl.sum(
-                (gl.expand_dims(other, 0) < gl.expand_dims(mine, 1)).to(gl.int32),
-                axis=1,
-            )
-    out = row_out + q * out_stride
-    gl.store(out + rank, mine.to(gl.int32), mask=i < count)
+    if HAS_CANDIDATES or overflow:
+        # Rank sort of the picked ids: ids are unique, unpicked slots hold the
+        # int64 max and rank after them.
+        gl.barrier()
+        mine = picked_smem.slice(0, TOPK).load(LR)
+        rank = i
+        # Column order already is position order without candidates, and with
+        # candidate blocks listed in ascending order; sort only otherwise.
+        previous = gl.gather(mine, gl.maximum(i - 1, 0), axis=0)
+        descents = gl.sum(((i > 0) & (i < count) & (mine < previous)).to(gl.int32), 0)
+        if descents > 0:
+            rank = gl.zeros([TOPK], gl.int32, layout=LR)
+            for j0 in gl.static_range(0, TOPK, 64):
+                other = picked_smem.slice(j0, 64).load(LC)
+                rank += gl.sum(
+                    (gl.expand_dims(other, 0) < gl.expand_dims(mine, 1)).to(gl.int32),
+                    axis=1,
+                )
+        gl.store(out + rank, mine.to(gl.int32), mask=i < count)
     gl.store(
         out + i,
         gl.full([TOPK], -1, gl.int32, layout=LR),
@@ -1161,5 +1338,8 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         HAS_LIMITS=live_widths is not None,
         RADIX_BITS=_SELECT_RADIX_BITS,
         NUM_WARPS=_SELECT_WARPS,
+        REGION=1024,
+        SEGMENT=256,
+        VEC=width % 4 == 0,
         num_warps=_SELECT_WARPS,
     )
