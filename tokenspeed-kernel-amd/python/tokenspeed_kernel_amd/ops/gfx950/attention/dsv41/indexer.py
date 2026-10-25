@@ -879,6 +879,9 @@ def dsv41_index_logits_gfx950(
             NUM_WARPS=2,
             num_warps=2,
             waves_per_eu=4,
+            # Unfused multiply-adds keep the score bits independent of how a
+            # variant's code contracts; both scorers produce the same bits.
+            enable_fp_fusion=False,
         )
         return
     # A per-query CTA walks its chunk one key tile at a time; shorter chunks
@@ -919,6 +922,7 @@ def dsv41_index_logits_gfx950(
         NUM_WARPS=2,
         num_warps=2,
         waves_per_eu=4,
+        enable_fp_fusion=False,
     )
 
 
