@@ -228,7 +228,9 @@ def run_dsv41_csa2_index_topk(
         q, w, _shards = _index_gather_heads(
             index_q[start:end], weights[start:end], process_group
         )
-        table = page_table[start:end].contiguous()
+        table = page_table[start:end]
+        if table.stride(0):
+            table = table.contiguous()
         # Consumers bound raw int64 lengths before narrowing. A dense input
         # needs no launch here; preserve the previous strided-input support.
         visible = visible_lens[start:end].contiguous()

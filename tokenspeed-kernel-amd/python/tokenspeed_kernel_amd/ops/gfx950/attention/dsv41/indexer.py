@@ -375,6 +375,365 @@ def gluon_dsv41_index_topk_gfx950(
         )
 
 
+@gluon.jit
+def _qtile_load_keys(
+    cache,
+    table,
+    tile_start,
+    end,
+    page_stride_bytes,
+    num_pages,
+    table_width,
+    dot_b_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+):
+    # A 32-row tile starts at a multiple of 32, so it never crosses a 64-row
+    # page and needs one scalar page lookup.
+    page = gl.load(table + gl.minimum(tile_start // 64, table_width - 1)).to(gl.int64)
+    page_ok = (page >= 0) & (page < num_pages)
+    base = cache + gl.where(page_ok, page, 0) * page_stride_bytes
+    row0 = tile_start % 64
+    packed_dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, dot_b_layout))[
+        :, None
+    ]
+    columns = gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+    key = gl.load(
+        base + ((row0 + columns) * _PACKED_DIM + packed_dims),
+        mask=(tile_start + columns) < end,
+        other=0,
+    )
+    scale_columns = gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[
+        :, None
+    ]
+    scale_groups = gl.arange(0, _SCALE_DIM, layout=gl.SliceLayout(0, b_scale_layout))[
+        None, :
+    ]
+    key_scales = gl.load(
+        base + (64 * _PACKED_DIM + (row0 + scale_columns) * _SCALE_DIM + scale_groups),
+        mask=(tile_start + scale_columns) < end,
+        other=127,
+    )
+    return key, key_scales, page_ok
+
+
+@gluon.jit
+def _qtile_load_queries(
+    q,
+    q_scales,
+    weights,
+    token,
+    stride_q_token,
+    stride_q_head,
+    stride_q_scale_token,
+    stride_q_scale_head,
+    stride_w_token,
+    stride_w_head,
+    mfma_layout: gl.constexpr,
+    dot_a_layout: gl.constexpr,
+    a_scale_layout: gl.constexpr,
+):
+    query_0, query_scale_0, weight_0 = _load_query_group(
+        q,
+        q_scales,
+        weights,
+        token,
+        0,
+        stride_q_token,
+        stride_q_head,
+        stride_q_scale_token,
+        stride_q_scale_head,
+        stride_w_token,
+        stride_w_head,
+        mfma_layout,
+        dot_a_layout,
+        a_scale_layout,
+    )
+    query_1, query_scale_1, weight_1 = _load_query_group(
+        q,
+        q_scales,
+        weights,
+        token,
+        16,
+        stride_q_token,
+        stride_q_head,
+        stride_q_scale_token,
+        stride_q_scale_head,
+        stride_w_token,
+        stride_w_head,
+        mfma_layout,
+        dot_a_layout,
+        a_scale_layout,
+    )
+    return query_0, query_scale_0, weight_0, query_1, query_scale_1, weight_1
+
+
+@gluon.jit
+def _qtile_score(
+    query_0,
+    query_scale_0,
+    weight_0,
+    query_1,
+    query_scale_1,
+    weight_1,
+    key,
+    key_scales,
+    mfma_layout: gl.constexpr,
+):
+    zero = gl.zeros([_HEADS_PER_MFMA, _BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+    heads_0 = gl.amd.cdna4.mfma_scaled(
+        a=query_0,
+        a_scale=query_scale_0,
+        a_format="e2m1",
+        b=key,
+        b_scale=key_scales,
+        b_format="e2m1",
+        acc=zero,
+    )
+    heads_0 = gl.maximum(heads_0, 0.0, propagate_nan=tl.PropagateNan.ALL)
+    scores = gl.sum(heads_0 * weight_0[:, None], axis=0)
+    heads_1 = gl.amd.cdna4.mfma_scaled(
+        a=query_1,
+        a_scale=query_scale_1,
+        a_format="e2m1",
+        b=key,
+        b_scale=key_scales,
+        b_format="e2m1",
+        acc=zero,
+    )
+    heads_1 = gl.maximum(heads_1, 0.0, propagate_nan=tl.PropagateNan.ALL)
+    return scores + gl.sum(heads_1 * weight_1[:, None], axis=0)
+
+
+@gluon.jit
+def _qtile_store(logits, token, logits_stride, positions, bound, page_ok, scores):
+    gl.store(
+        logits + token * logits_stride + positions,
+        scores,
+        mask=(positions < bound) & page_ok,
+    )
+
+
+def _qtile_launch_metadata(grid, kernel, args):
+    queries, width = args["logits"].shape
+    return {
+        "name": kernel.name,
+        "flops4": 2 * queries * 32 * width * 128,
+        "bytes": grid[0] * width * 68 + queries * width * 4,
+    }
+
+
+@gluon.jit(
+    launch_metadata=_qtile_launch_metadata,
+    do_not_specialize=(
+        "queries",
+        "logits_stride",
+        "num_pages",
+        "table_width",
+        "max_candidates",
+    ),
+)
+def gluon_dsv41_index_qtile_gfx950(
+    q,
+    q_scales,
+    weights,
+    index_k_cache,
+    visible,
+    page_table,
+    logits,
+    queries,
+    stride_q_token,
+    stride_q_head,
+    stride_q_scale_token,
+    stride_q_scale_head,
+    stride_w_token,
+    stride_w_head,
+    logits_stride,
+    page_stride_bytes,
+    num_pages,
+    table_width,
+    max_candidates,
+    CHUNK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    # Four consecutive queries sharing one page table row score each key tile.
+    first = gl.program_id(0) * 4
+    candidate_start = gl.program_id(1) * CHUNK_N
+    layouts: gl.constexpr = _indexer_mfma_layouts(NUM_WARPS)
+    mfma_layout: gl.constexpr = layouts[0]
+    dot_a_layout: gl.constexpr = layouts[1]
+    dot_b_layout: gl.constexpr = layouts[2]
+    a_scale_layout: gl.constexpr = layouts[3]
+    b_scale_layout: gl.constexpr = layouts[4]
+    token_0 = first
+    token_1 = gl.minimum(first + 1, queries - 1)
+    token_2 = gl.minimum(first + 2, queries - 1)
+    token_3 = gl.minimum(first + 3, queries - 1)
+    capacity = gl.minimum(table_width * 64, max_candidates)
+    vis_0 = gl.minimum(
+        gl.maximum(gl.load(visible + token_0).to(gl.int64), 0), capacity
+    ).to(gl.int32)
+    vis_1 = gl.where(
+        first + 1 < queries,
+        gl.minimum(gl.maximum(gl.load(visible + token_1).to(gl.int64), 0), capacity).to(
+            gl.int32
+        ),
+        0,
+    )
+    vis_2 = gl.where(
+        first + 2 < queries,
+        gl.minimum(gl.maximum(gl.load(visible + token_2).to(gl.int64), 0), capacity).to(
+            gl.int32
+        ),
+        0,
+    )
+    vis_3 = gl.where(
+        first + 3 < queries,
+        gl.minimum(gl.maximum(gl.load(visible + token_3).to(gl.int64), 0), capacity).to(
+            gl.int32
+        ),
+        0,
+    )
+    candidate_end = gl.maximum(gl.maximum(vis_0, vis_1), gl.maximum(vis_2, vis_3))
+    candidate_end = gl.minimum(candidate_end, candidate_start + CHUNK_N)
+    if candidate_start >= candidate_end:
+        return
+
+    qa_0, qsa_0, wa_0, qb_0, qsb_0, wb_0 = _qtile_load_queries(
+        q,
+        q_scales,
+        weights,
+        token_0,
+        stride_q_token,
+        stride_q_head,
+        stride_q_scale_token,
+        stride_q_scale_head,
+        stride_w_token,
+        stride_w_head,
+        mfma_layout,
+        dot_a_layout,
+        a_scale_layout,
+    )
+    qa_1, qsa_1, wa_1, qb_1, qsb_1, wb_1 = _qtile_load_queries(
+        q,
+        q_scales,
+        weights,
+        token_1,
+        stride_q_token,
+        stride_q_head,
+        stride_q_scale_token,
+        stride_q_scale_head,
+        stride_w_token,
+        stride_w_head,
+        mfma_layout,
+        dot_a_layout,
+        a_scale_layout,
+    )
+    qa_2, qsa_2, wa_2, qb_2, qsb_2, wb_2 = _qtile_load_queries(
+        q,
+        q_scales,
+        weights,
+        token_2,
+        stride_q_token,
+        stride_q_head,
+        stride_q_scale_token,
+        stride_q_scale_head,
+        stride_w_token,
+        stride_w_head,
+        mfma_layout,
+        dot_a_layout,
+        a_scale_layout,
+    )
+    qa_3, qsa_3, wa_3, qb_3, qsb_3, wb_3 = _qtile_load_queries(
+        q,
+        q_scales,
+        weights,
+        token_3,
+        stride_q_token,
+        stride_q_head,
+        stride_q_scale_token,
+        stride_q_scale_head,
+        stride_w_token,
+        stride_w_head,
+        mfma_layout,
+        dot_a_layout,
+        a_scale_layout,
+    )
+    output_columns = gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
+    key, key_scales, page_ok = _qtile_load_keys(
+        index_k_cache,
+        page_table,
+        candidate_start,
+        candidate_end,
+        page_stride_bytes,
+        num_pages,
+        table_width,
+        dot_b_layout,
+        b_scale_layout,
+    )
+    for tile_offset in range(0, CHUNK_N, _BLOCK_N):
+        tile_start = candidate_start + tile_offset
+        # Prefetch the next tile before this tile's MFMAs.
+        next_key, next_key_scales, next_page_ok = _qtile_load_keys(
+            index_k_cache,
+            page_table,
+            tile_start + _BLOCK_N,
+            candidate_end,
+            page_stride_bytes,
+            num_pages,
+            table_width,
+            dot_b_layout,
+            b_scale_layout,
+        )
+        positions = tile_start + output_columns
+        _qtile_store(
+            logits,
+            token_0,
+            logits_stride,
+            positions,
+            vis_0,
+            page_ok,
+            _qtile_score(
+                qa_0, qsa_0, wa_0, qb_0, qsb_0, wb_0, key, key_scales, mfma_layout
+            ),
+        )
+        _qtile_store(
+            logits,
+            token_1,
+            logits_stride,
+            positions,
+            vis_1,
+            page_ok,
+            _qtile_score(
+                qa_1, qsa_1, wa_1, qb_1, qsb_1, wb_1, key, key_scales, mfma_layout
+            ),
+        )
+        _qtile_store(
+            logits,
+            token_2,
+            logits_stride,
+            positions,
+            vis_2,
+            page_ok,
+            _qtile_score(
+                qa_2, qsa_2, wa_2, qb_2, qsb_2, wb_2, key, key_scales, mfma_layout
+            ),
+        )
+        _qtile_store(
+            logits,
+            token_3,
+            logits_stride,
+            positions,
+            vis_3,
+            page_ok,
+            _qtile_score(
+                qa_3, qsa_3, wa_3, qb_3, qsb_3, wb_3, key, key_scales, mfma_layout
+            ),
+        )
+        key = next_key
+        key_scales = next_key_scales
+        page_ok = next_page_ok
+
+
 def dsv41_index_logits_gfx950(
     values,
     scales,
@@ -410,6 +769,36 @@ def dsv41_index_logits_gfx950(
     queries, width = logits.shape
     cand = table if candidates is None else candidates
     scale_dim = 4
+    if candidates is None and table.stride(0) == 0:
+        # Every query reads the same page table row: score four queries per CTA.
+        gluon_dsv41_index_qtile_gfx950[
+            (triton.cdiv(queries, 4), triton.cdiv(width, chunk_n))
+        ](
+            values,
+            scales.view(torch.uint8).reshape(queries, _MFMA_HEADS, scale_dim),
+            w,
+            cache_2d,
+            visible,
+            table,
+            logits,
+            queries,
+            values.stride(0),
+            values.stride(1),
+            scale_dim * _MFMA_HEADS,
+            scale_dim,
+            w.stride(0),
+            w.stride(1),
+            logits.stride(0),
+            int(cache_2d.stride(0)),
+            int(cache_2d.shape[0]),
+            int(table.shape[1]),
+            width,
+            CHUNK_N=chunk_n,
+            NUM_WARPS=2,
+            num_warps=2,
+            waves_per_eu=4,
+        )
+        return
     gluon_dsv41_index_topk_gfx950[(queries, triton.cdiv(width, score_chunk_size))](
         values,
         scales.view(torch.uint8).reshape(queries, _MFMA_HEADS, scale_dim),
