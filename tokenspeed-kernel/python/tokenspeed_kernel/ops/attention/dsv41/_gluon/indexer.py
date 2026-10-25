@@ -63,30 +63,34 @@ def _pack_index_queries_padded(
     W1,
     HEADS: tl.constexpr,
     ZERO: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
+    first = tl.program_id(1) * BLOCK_H
     if ZERO:
         # Zero a per-token int32 output alongside the pack, saving a launch.
-        if head == 0:
+        if first == 0:
             tl.store(Z + token, 0)
+    head = (first + tl.arange(0, BLOCK_H)).to(tl.int64)
     d = tl.arange(0, 128)
     live = head < HEADS
     # Inner-strided views can span more than int32 elements within one head.
-    x = tl.load(Q + token * Q0 + head * Q1 + d.to(tl.int64) * Q2, live, 0.0).to(
-        tl.float32
-    )
-    grouped = tl.reshape(x, (4, 32))
+    x = tl.load(
+        Q + token * Q0 + head[:, None] * Q1 + d[None, :].to(tl.int64) * Q2,
+        live[:, None],
+        0.0,
+    ).to(tl.float32)
+    grouped = tl.reshape(x, (BLOCK_H, 4, 32))
     # Match cache_pack(index): multiplication by the rounded reciprocal of six.
-    raw = tl.maximum(tl.max(tl.abs(grouped), 1), 6 * 2.0**-126) * (1.0 / 6.0)
-    packed, exponent = _mxfp4_index_rows(
-        tl.reshape(grouped, (1, 4, 32)), tl.reshape(raw, (1, 4)), 1
-    )
-    packed = tl.reshape(packed, (64,))
-    word = tl.sum(_ue8m0_word(exponent), 0)
+    raw = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126) * (1.0 / 6.0)
+    packed, exponent = _mxfp4_index_rows(grouped, raw, BLOCK_H)
+    word = _ue8m0_word(exponent)
     row = token * 32 + head
-    tl.store(V + row * 64 + tl.arange(0, 64), tl.where(live, packed, 0))
-    tl.store(S + row, tl.where(live, word.to(tl.int32), 0))
+    tl.store(
+        V + row[:, None] * 64 + tl.arange(0, 64)[None, :],
+        tl.where(live[:, None], packed, 0),
+    )
+    tl.store(S + row, tl.where(live, word, 0))
     weight = tl.load(W + token * W0 + head * W1, live, 0.0).to(tl.float32)
     tl.store(F + row, weight)
 
@@ -103,7 +107,7 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor, zero=None):
     scales = torch.empty((tokens, 32), dtype=torch.int32, device=q.device)
     folded = torch.empty((tokens, 32), dtype=torch.float32, device=q.device)
     if tokens:
-        _pack_index_queries_padded[(tokens, 32)](
+        _pack_index_queries_padded[(tokens, 8)](
             q,
             weights,
             values,
@@ -114,6 +118,7 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor, zero=None):
             *weights.stride(),
             heads,
             zero is not None,
+            4,
             num_warps=4,
             enable_fp_fusion=False,
         )
