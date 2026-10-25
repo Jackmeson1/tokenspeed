@@ -914,7 +914,7 @@ def dsv41_index_logits_gfx950(
 
 # Radix-select digit split of the 32-bit order key: 11 + 11 + 10 bits.
 _SELECT_RADIX_BITS = 11
-_SELECT_WARPS = 8
+_SELECT_WARPS = 16
 
 
 def _select_launch_metadata(grid, kernel, args):
@@ -1476,7 +1476,7 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         HAS_LIMITS=live_widths is not None,
         RADIX_BITS=_SELECT_RADIX_BITS,
         NUM_WARPS=_SELECT_WARPS,
-        REGION=1024,
+        REGION=512,
         SEGMENT=256,
         VEC=width % 4 == 0,
         num_warps=_SELECT_WARPS,
