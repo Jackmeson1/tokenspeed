@@ -79,7 +79,6 @@ class TestSplitHeadlessArgv:
             "--engine-startup-timeout",
             "--gateway-startup-timeout",
             "--drain-timeout",
-            "--control-port",
         ],
     )
     def test_orchestrator_flags_rejected(self, flag):

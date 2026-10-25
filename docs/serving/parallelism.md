@@ -184,7 +184,7 @@ reduce-scatter remains batch-invariant, see `docs/design/numerics.md`).
 Each attention-DP rank owns a private prefix cache, so multi-turn requests
 only reuse their cache when every turn lands on the same rank. The
 `data_parallel_rank` request field (`Engine.generate` / `async_generate`, or
-the gateway's gRPC protocol) pins a request to one rank: it dispatches
+the wire request a frontend submits) pins a request to one rank: it dispatches
 straight there, bypassing load balancing — overload spill is the router's
 job. An invalid pin fails that request. The engine keeps serving. Engines
 without attention DP drop the pin.
@@ -197,10 +197,10 @@ since any decode rank finds the prefill rank from the room; without one, or
 with one out of range (logged and ignored), the room residue places the
 request.
 
-With the bundled gateway, pass `--policy cache_aware --dp-aware` to
-`ts serve` to enable per-rank affinity routing. This requires bundled smg
-releases that carry the TokenSpeed dp-affinity support; see the lockstep
-note in `serve_smg.py`.
+Under `ts serve`, the engine's attention-DP ranks register with the bundled
+gateway as one grouped worker, which places each unpinned request on its
+least-loaded rank itself; the gateway's `--dp-aware` expansion does not apply
+to it.
 
 ## MoE deployments
 
@@ -808,7 +808,11 @@ Each node must use the same model, backend, precision, and scheduler settings.
 Only `--node-rank` should differ between nodes.
 
 Run one `tokenspeed serve` per node. Node rank 0 serves the HTTP API. Higher
-ranks run the engine only and expose no endpoint.
+ranks run the engine only and expose no endpoint. The bundled gateway reaches
+the engine over a same-host lane, so with attention DP every replica's first
+rank must be on node 0; `tokenspeed serve` refuses a layout that puts one on
+another node. Serve such a layout with `tokenspeed serve --headless` on every
+node behind a frontend that reaches remote engines.
 
 ### Under a launcher
 

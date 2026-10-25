@@ -47,7 +47,6 @@ from tokenspeed.runtime.engine.output_processor import (  # noqa: E402
     OutputProcessor,
     ReqState,
 )
-from tokenspeed.runtime.entrypoints import control_server  # noqa: E402
 from tokenspeed.runtime.entrypoints.sglang_compat_http import (  # noqa: E402
     build_sglang_compat_app,
 )
@@ -186,28 +185,6 @@ class TestWeightVersionHTTP:
                 ]
             }
         )
-
-    def test_control_server_exposes_only_sglang_rl_routes(self):
-        routes = {
-            (route.path, frozenset(route.methods or []))
-            for route in control_server.app.routes
-        }
-        assert (("/get_weight_version", frozenset({"GET"}))) in (routes)
-        assert (("/model_info", frozenset({"GET"}))) in (routes)
-        assert (("/update_weight_version", frozenset({"POST"}))) in (routes)
-        assert (("/update_weights_from_mooncake", frozenset({"POST"}))) in (routes)
-        assert (("/v1/loads", frozenset({"GET"}))) in (routes)
-        removed_vllm_routes = {
-            ("/init_weight_transfer_engine", frozenset({"POST"})),
-            ("/start_weight_update", frozenset({"POST"})),
-            ("/update_weights", frozenset({"POST"})),
-            ("/finish_weight_update", frozenset({"POST"})),
-            ("/pause", frozenset({"POST"})),
-            ("/resume", frozenset({"POST"})),
-            ("/get_world_size", frozenset({"GET"})),
-            ("/is_paused", frozenset({"GET"})),
-        }
-        assert removed_vllm_routes.isdisjoint(routes)
 
 
 class _Request:

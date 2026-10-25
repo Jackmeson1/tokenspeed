@@ -40,7 +40,6 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromMooncakeReqInput,
     mooncake_load_weight_version,
 )
-from tokenspeed.runtime.entrypoints import control_server
 from tokenspeed.runtime.entrypoints.sglang_compat_http import (
     build_sglang_compat_app,
 )
@@ -149,17 +148,6 @@ def test_request_fields_are_explicit_and_the_default_lives_in_one_helper():
             version=3, flush_cache=False, weight_version="ckpt"
         )
         == "ckpt"
-    )
-
-
-def test_control_server_proxies_the_route_with_a_long_read_timeout():
-    routes = {
-        (route.path, frozenset(route.methods or []))
-        for route in control_server.app.routes
-    }
-    assert ("/update_weights_from_mooncake", frozenset({"POST"})) in routes
-    assert control_server._WEIGHT_LOAD_PROXY_TIMEOUT.sock_read > (
-        control_server._PROXY_TIMEOUT.sock_read
     )
 
 

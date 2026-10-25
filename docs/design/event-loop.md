@@ -35,11 +35,11 @@ socket closed, which does not reconnect) stops the engine the same way. One
 rank is the same path with groups of one.
 
 The launcher (`entrypoints/engine.py`) starts the ranks through
-`start_rust_host`, whatever the deployment: the in-process `Engine`, the
-gRPC servicer behind `ts serve`, and `ts serve --headless` for an external
-frontend. Each rank dials the frontend's handshake socket; the in-process
-frontend is `tokenspeed_engine.Frontend` (`ts-py` over `ts-client`) under
-`AsyncLLM`. An EPD encode node's ranks run the host's encode mode instead
+`start_rust_host`, whatever the deployment: the in-process `Engine`, `ts
+serve` (SMG's gateway on its direct ZMQ lane, which binds the frontend
+sockets) and `ts serve --headless` for an external frontend. Each rank dials
+the frontend's handshake socket; the in-process frontend is
+`tokenspeed_engine.Frontend` (`ts-py` over `ts-client`) under `AsyncLLM`. An EPD encode node's ranks run the host's encode mode instead
 (`ts-control`'s `encode` loop over `epd/encode_host.py`): no scheduler, no
 event loop. Their first rank dials the frontend the same way and takes
 encode requests.
