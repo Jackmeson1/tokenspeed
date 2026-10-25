@@ -1092,6 +1092,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             requires_bootstrap: pd.is_some(),
             multimodal: setup.epd_prefill,
             grammar: setup.grammar,
+            reasoning: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),

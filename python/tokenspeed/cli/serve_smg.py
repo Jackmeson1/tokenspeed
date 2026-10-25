@@ -32,8 +32,7 @@ replica whose first rank sits on another node (``_engine_count``).
 external frontend such as ``smg serve --backend tokenspeed --connection-mode
 zmq`` or Dynamo binds the msgpack ZMQ sockets and this engine dials in at
 ``tcp://{--data-parallel-address}:{--data-parallel-rpc-port}`` (default
-``tcp://127.0.0.1:30500``). Headless mode implies ``--skip-tokenizer-init``
-(see ``launch_scheduler_headless``).
+``tcp://127.0.0.1:30500``).
 
 Model-family defaults (``_args_with_default_model_parsers``) pick the
 reasoning and tool-call parsers from the model. Muse Spark Open also gets the

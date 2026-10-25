@@ -18,23 +18,23 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! `tokenspeed_engine._native`: the Python frontend's connection to
-//! TokenSpeed engines, over [`ts_client`].
+//! `tokenspeed_engine._native`: Python's connection to TokenSpeed engines,
+//! over [`ts_client`], for tests and tools that drive an engine
+//! (`tokenspeed.runtime.entrypoints.wire_driver`).
 //!
-//! The Python frontend (`AsyncLLM`, under the `Engine` API and the gRPC
-//! servicer) tokenizes, detokenizes and matches stop strings; this module
-//! submits its tokenized requests to the engines and hands back their
-//! outputs. The client's sockets and streams run on the Tokio runtime
+//! This module submits token-id requests to the engines and hands back
+//! their outputs; tokenizing, detokenizing and stop strings are the
+//! caller's. The client's sockets and streams run on the Tokio runtime
 //! `pyo3-async-runtimes` owns, so a Python thread waiting on them does not
 //! hold the GIL.
 //!
-//! Every request's outputs land in one queue, which the frontend drains a
+//! Every request's outputs land in one queue, which the caller drains a
 //! batch at a time ([`Frontend::next_outputs`]): one Python wakeup per step
 //! of the engines, not one per request.
 //!
 //! Requests and control operations cross as their wire frames
 //! (`zmq_wire`'s encoding of the `io_struct` messages), so the Python
-//! structs stay the frontend's representation; control replies come back the
+//! structs stay the caller's representation; control replies come back the
 //! same way.
 
 mod bootstrap;
@@ -311,25 +311,6 @@ impl Frontend {
                 batch.push(next);
             }
             Ok(Deliveries(batch))
-        })
-    }
-
-    /// Send an EPD encode server an item to embed, given as its wire frames
-    /// (an encoded `EncodeRequest`, without the type frame). Nothing answers;
-    /// awaiting this returns once the server has the request.
-    fn encode<'py>(&self, py: Python<'py>, frames: Vec<Vec<u8>>) -> PyResult<Bound<'py, PyAny>> {
-        let request = match EngineRequest::from_frames(&request_frames(
-            ts_wire::frames::REQ_TYPE_ENCODE,
-            frames,
-        ))
-        .map_err(engine_error)?
-        {
-            EngineRequest::Encode(request) => *request,
-            _ => unreachable!("the type frame names an encode request"),
-        };
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client.encode(request).await.map_err(engine_error)
         })
     }
 

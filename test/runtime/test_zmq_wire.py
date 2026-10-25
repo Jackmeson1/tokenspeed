@@ -123,6 +123,15 @@ def test_generate_request_is_tagged_positional_tuple():
     assert raw[10] is True  # stream
 
 
+def test_the_dp_pin_rides_last():
+    # The wire is append-only: the attention-DP pin, the newest field, stays
+    # the request's last element.
+    req = _make_request(rid="x", input_ids=[9])
+    req.data_parallel_rank = 3
+    raw = msgspec.msgpack.decode(_encode_payload(req))
+    assert raw[-1] == 3
+
+
 def test_sampling_params_wire_order():
     """SamplingParams rides nested as an UNtagged positional array; its
     declaration order is cross-language wire contract."""

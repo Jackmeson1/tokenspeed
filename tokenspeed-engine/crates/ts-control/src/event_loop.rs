@@ -1476,7 +1476,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// `POST /rebalance_experts`: take the snapshot now, if no rebalance runs.
+    /// `RebalanceExpertsReqInput`: take the snapshot now, if no rebalance runs.
     fn begin_manual_rebalance(&mut self) -> Result<(bool, String), LoopError> {
         let Some(controller) = self.eplb.as_mut() else {
             return Ok((

@@ -20,9 +20,8 @@
 
 """The headless launcher: KV bootstrap hosting and scheduler supervision.
 
-Without an in-process frontend there is no ``AsyncLLM`` to start a prefill
-engine's KV bootstrap server, so the launcher does; and with nothing above it
-to clean up, the launcher must not wait forever on a scheduler that ignores
+The launcher starts a prefill engine's KV bootstrap server; and with nothing
+above it to clean up, it must not wait forever on a scheduler that ignores
 its termination.
 """
 

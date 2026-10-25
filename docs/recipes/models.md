@@ -1330,37 +1330,6 @@ prefix hits exactly as above and ships each group's retained tail. The
 decode node lands the tail and never re-feeds. Even on one machine, let
 Mooncake pick an RDMA transport rather than forcing the intra-node NVLink one.
 
-### GB300 Slurm 1P1D CI
-
-[`deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml`](../../test/ci/eval/deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml)
-runs one TP4 prefill engine and one TP4 decode engine on two four-GPU nodes.
-Node 0 also hosts the SMG gateway and the Slurm evaluation client, which
-connects to `127.0.0.1:8000`. Both engines use same-checkpoint DSpark,
-`mega_moe` with expert parallelism on Blackwell, host-resident Engram tables,
-and Mooncake transfer after the completed prompt (`layerwise-interval=0`).
-The YAML disables decode prefix caching. The gateway uses `deepseek_v31`
-reasoning parsing. The 262144-token cache budget limits admission
-independently of the 32768-token per-request context and 16-sequence cap.
-
-The gate checks GSM8K accuracy of at least 0.90 on 100 samples with EvalScope
-1.11.1, greedy decoding, concurrency 8, and up to 30000 generated tokens.
-It participates in the GB300 Slurm per-commit workflow. To run only this case,
-select its YAML in **Slurm Dispatch**, choose cluster `gb300`, and optionally
-provide a pull request number.
-
-The launcher uses `PD_SLURM=1` to assign one role per node and clears Slurm
-topology discovery only inside each worker process. Share the launcher's
-job-and-step-scoped artifact directory between nodes. It publishes role
-readiness atomically and verifies cross-node gRPC health before starting the
-gateway.
-Worker logs remain separate as `prefill.log`, `decode.log`, and `lb.log`.
-When you need an explicit RDMA device selection, set
-`DISAGGREGATION_IB_DEVICE`. The GB300 task selects
-`mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the InfiniBand fabric.
-Automatic discovery also includes Ethernet RNICs, which can
-cause incompatible RoCE/InfiniBand endpoint pairings during the RDMA handshake.
-Without `PD_SLURM=1`, the same launcher retains the single-node smoke topology.
-
 ## Nemotron-3 Super
 
 `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` is a Nemotron-H hybrid. Its

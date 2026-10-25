@@ -73,7 +73,7 @@ def main() -> None:
         "Dynamo — "
         "binds the msgpack ZMQ sockets and this engine dials in at "
         "--data-parallel-address/--data-parallel-rpc-port (default "
-        "tcp://127.0.0.1:30500). Implies --skip-tokenizer-init.",
+        "tcp://127.0.0.1:30500).",
     )
     serve_parser.set_defaults(func=_serve)
 

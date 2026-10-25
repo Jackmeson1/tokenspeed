@@ -119,6 +119,10 @@ from tokenspeed.runtime.grammar.capturable_grammar import (
     resolve_grammar_completion,
 )
 from tokenspeed.runtime.grammar.host_grammar import HostGrammar, HostGrammarEntries
+from tokenspeed.runtime.grammar.reasoning_structural_tag import (
+    ReasoningGrammar,
+    reasoning_grammar,
+)
 from tokenspeed.runtime.metrics.config import metrics_enabled
 from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
 from tokenspeed.runtime.multimodal.inputs import (
@@ -313,12 +317,16 @@ class GrammarSettings:
         any_whitespace: JSON schemas allow any whitespace.
         compile_timeout_s: How long a request may wait for its grammar.
         max_retries: Timeouts a grammar is retried after.
+        reasoning: How a JSON schema waits for the reasoning block of the
+            ``--reasoning-parser``; None without one, or when xgrammar has
+            no template for it.
     """
 
     tokenizer_info: str
     any_whitespace: bool
     compile_timeout_s: float
     max_retries: int
+    reasoning: ReasoningGrammar | None
 
 
 def grammar_tokenizer_info(tokenizer, vocab_size: int, eos_token_ids) -> str:
@@ -1272,6 +1280,11 @@ class HostBootstrap:
                             server_args.grammar_compile_timeout_secs
                         ),
                         max_retries=int(server_args.grammar_compile_max_retries),
+                        reasoning=(
+                            reasoning_grammar(server_args.reasoning_parser, tokenizer)
+                            if server_args.reasoning_parser
+                            else None
+                        ),
                     )
                     if server_args.grammar_backend == "xgrammar"
                     else None

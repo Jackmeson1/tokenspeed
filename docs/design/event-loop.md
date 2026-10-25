@@ -35,11 +35,10 @@ socket closed, which does not reconnect) stops the engine the same way. One
 rank is the same path with groups of one.
 
 The launcher (`entrypoints/engine.py`) starts the ranks through
-`start_rust_host`, whatever the deployment: the in-process `Engine`, `ts
-serve` (SMG's gateway on its direct ZMQ lane, which binds the frontend
-sockets) and `ts serve --headless` for an external frontend. Each rank dials
-the frontend's handshake socket; the in-process frontend is
-`tokenspeed_engine.Frontend` (`ts-py` over `ts-client`) under `AsyncLLM`. An EPD encode node's ranks run the host's encode mode instead
+`start_rust_host`, whatever the deployment: `ts serve` (SMG's gateway on its
+direct ZMQ lane, which binds the frontend sockets) and `ts serve --headless`
+for an external frontend such as Dynamo's. Each rank dials the frontend's
+handshake socket. An EPD encode node's ranks run the host's encode mode instead
 (`ts-control`'s `encode` loop over `epd/encode_host.py`): no scheduler, no
 event loop. Their first rank dials the frontend the same way and takes
 encode requests.
@@ -556,7 +555,7 @@ no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
 
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
-Weight-update `flush_cache` and standalone `/flush_cache` first MAX-reduce
+Weight-update `flush_cache` and a standalone flush first MAX-reduce
 flush intent across attention DP so every DP rank enters the same
 collectives — the frontend sends a flush to every engine separately. The
 same reduction gates the weight operations themselves (NCCL group
@@ -578,15 +577,15 @@ round and the internal step the next — still one blocking device call per
 round. Because every EP rank is inside a gated step at once, the rebalance
 may run a collective over the EP group there (summing the load under
 all-to-all EP, broadcasting the committed placement), which the profile's
-`dump_expert_load` must not. The manual `POST /rebalance_experts` is a
-frontend operation on the first queue that starts the same internal
+`dump_expert_load` must not. The manual rebalance (`RebalanceExpertsReqInput`)
+is a frontend operation on the first queue that starts the same internal
 sequence. The loop refuses a memory release while a rebalance is in progress
 and, once drained, the release waits while chunk steps still write the
 weights. A cache clear MIN-reduces the scheduler's non-mutating
 `can_clear_cache` across the replica and then across attention DP — DP
 replicas share Mooncake objects — then MIN-reduces an error-returning L3
-namespace deletion, before any rank mutates Device/Host. The frontend ANDs
-every engine's reply. Independent TokenSpeed jobs that share a tenant are not
+namespace deletion, before any rank mutates Device/Host. The frontend
+combines every engine's reply. Independent TokenSpeed jobs that share a tenant are not
 in those groups.
 
 **The expert rebalance** (`eplb`, `--enable-eplb`). The controller counts the

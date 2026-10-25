@@ -43,11 +43,11 @@ GPQA_DATASET_SOURCE_PRELUDE = (
 )
 DATASETS = {
     "aime25": {
-        "count": 8,
+        "count": 7,
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 16,
+        "count": 15,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -55,7 +55,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 7,
+        "count": 6,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -63,7 +63,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "cais/mmlu"},
     },
     "ocr_bench": {
-        "count": 3,
+        "count": 1,
         "dataset_args": {"dataset_id": "echo840/OCRBench"},
     },
 }
