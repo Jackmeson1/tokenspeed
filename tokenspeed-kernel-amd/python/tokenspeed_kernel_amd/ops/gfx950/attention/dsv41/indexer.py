@@ -152,7 +152,9 @@ def gluon_dsv41_index_topk_gfx950(
         # Every candidate column is written, -inf when it maps to no row.
         width = CANDIDATES * 8
     else:
-        width = vis
+        # Block selection reads whole 8-row blocks: write -inf up to the end
+        # of the last visible block.
+        width = (vis + 7) // 8 * 8
     scored_end = gl.minimum(width, max_candidates)
     if split * SCORE_CHUNK >= scored_end:
         return
@@ -459,11 +461,15 @@ def _qtile_score(
 
 
 @gluon.jit
-def _qtile_store(logits, token, logits_stride, positions, bound, page_ok, scores):
+def _qtile_store(
+    logits, token, logits_stride, positions, bound, limit, page_ok, scores
+):
+    # Write -inf up to the end of the last visible 8-row block, which block
+    # selection reads whole.
     gl.store(
         logits + token * logits_stride + positions,
-        gl.where(page_ok, scores, -float("inf")),
-        mask=positions < bound,
+        gl.where(page_ok & (positions < bound), scores, -float("inf")),
+        mask=(positions < (bound + 7) // 8 * 8) & (positions < limit),
     )
 
 
@@ -501,7 +507,7 @@ def _token_tile_keys(
         columns = tile_start + gl.arange(
             0, _BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
         )
-        live = (columns < end) & page_ok
+        live = (columns < end) & (columns < visible) & page_ok
     else:
         packed_dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, dot_b_layout))[
             :, None
@@ -761,6 +767,7 @@ def gluon_dsv41_index_qtile_gfx950(
             logits_stride,
             positions,
             vis_0,
+            max_candidates,
             page_ok,
             _qtile_score(
                 qa_0, qsa_0, wa_0, qb_0, qsb_0, wb_0, key, key_scales, mfma_layout
@@ -772,6 +779,7 @@ def gluon_dsv41_index_qtile_gfx950(
             logits_stride,
             positions,
             vis_1,
+            max_candidates,
             page_ok,
             _qtile_score(
                 qa_1, qsa_1, wa_1, qb_1, qsb_1, wb_1, key, key_scales, mfma_layout
@@ -783,6 +791,7 @@ def gluon_dsv41_index_qtile_gfx950(
             logits_stride,
             positions,
             vis_2,
+            max_candidates,
             page_ok,
             _qtile_score(
                 qa_2, qsa_2, wa_2, qb_2, qsb_2, wb_2, key, key_scales, mfma_layout
@@ -794,6 +803,7 @@ def gluon_dsv41_index_qtile_gfx950(
             logits_stride,
             positions,
             vis_3,
+            max_candidates,
             page_ok,
             _qtile_score(
                 qa_3, qsa_3, wa_3, qb_3, qsb_3, wb_3, key, key_scales, mfma_layout
