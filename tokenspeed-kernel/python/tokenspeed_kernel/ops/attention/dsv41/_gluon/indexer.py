@@ -55,15 +55,21 @@ def _pack_index_queries_padded(
     V,
     S,
     F,
+    Z,
     Q0,
     Q1,
     Q2,
     W0,
     W1,
     HEADS: tl.constexpr,
+    ZERO: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
+    if ZERO:
+        # Zero a per-token int32 output alongside the pack, saving a launch.
+        if head == 0:
+            tl.store(Z + token, 0)
     d = tl.arange(0, 128)
     live = head < HEADS
     # Inner-strided views can span more than int32 elements within one head.
@@ -85,8 +91,11 @@ def _pack_index_queries_padded(
     tl.store(F + row, weight)
 
 
-def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
-    """Write AMD's dense 32-head FP4 planes and FP32 weights without relayouts."""
+def _pack_index_q(q: torch.Tensor, weights: torch.Tensor, zero=None):
+    """Write AMD's dense 32-head FP4 planes and FP32 weights without relayouts.
+
+    ``zero`` is None or an int32 [tokens] tensor to fill with zeros.
+    """
     tokens, heads, _ = q.shape
     if not 1 <= heads <= 32:
         raise ValueError("AMD CSA2 MXFP4 indexer supports 1..32 heads")
@@ -100,9 +109,11 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
             values,
             scales,
             folded,
+            folded if zero is None else zero,
             *q.stride(),
             *weights.stride(),
             heads,
+            zero is not None,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -169,7 +180,8 @@ def run_dsv41_csa2_index_topk(
 ):
     """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch.
 
-    ``launch_logits`` scores a query tile into -inf-initialized FP32 logits;
+    ``launch_logits`` scores a tile of packed queries into FP32 logits and
+    writes every column the selections read (-inf where nothing is scored);
     ``select_rows`` has the ``select_rows_torch`` contract and
     ``select_blocks`` the ``index_block_select`` contract.
     """
@@ -220,14 +232,12 @@ def run_dsv41_csa2_index_topk(
         cache_2d = cache_2d.contiguous()
     query_chunk_size = min(int(query_chunk_size), 256)
     make_blocks = bool(candidate_topk)
-    if not make_blocks:
-        block_lens.zero_()
+    # Pack every query once; the pack also zeroes unused block lengths.
+    q, w, _shards = _index_gather_heads(index_q, weights, process_group)
+    values, scales, folded = _pack_index_q(q, w, None if make_blocks else block_lens)
 
     for start in range(0, tokens, query_chunk_size):
         end = min(start + query_chunk_size, tokens)
-        q, w, _shards = _index_gather_heads(
-            index_q[start:end], weights[start:end], process_group
-        )
         table = page_table[start:end]
         if table.stride(0):
             table = table.contiguous()
@@ -251,15 +261,13 @@ def run_dsv41_csa2_index_topk(
             )
             tile_visible = visible[query_begin:query_end]
             tile_queries = query_end - query_begin
-            logits = torch.full(
-                (tile_queries, width),
-                -float("inf"),
-                dtype=torch.float32,
-                device=q.device,
+            logits = torch.empty(
+                (tile_queries, width), dtype=torch.float32, device=q.device
             )
             launch_logits(
-                q[query_begin:query_end],
-                w[query_begin:query_end],
+                values[output_begin:output_end],
+                scales[output_begin:output_end],
+                folded[output_begin:output_end],
                 cache_2d,
                 table[query_begin:query_end],
                 tile_visible,
@@ -290,13 +298,12 @@ def run_dsv41_csa2_index_topk(
 
 
 def launch_gfx950_logits(
-    q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
+    values, scales, w, cache_2d, table, visible, candidates, logits, score_chunk_size
 ):
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
         dsv41_index_logits_gfx950,
     )
 
-    values, scales, w = _pack_index_q(q, w)
     dsv41_index_logits_gfx950(
         values,
         scales,
@@ -311,13 +318,14 @@ def launch_gfx950_logits(
 
 
 def launch_gfx1250_logits(
-    q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
+    values, scales, w, cache_2d, table, visible, candidates, logits, score_chunk_size
 ):
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
         dsv41_index_logits_gfx1250,
     )
 
-    values, scales, w = _pack_index_q(q, w)
+    # The gfx1250 scorer writes scored columns only.
+    logits.fill_(-float("inf"))
     dsv41_index_logits_gfx1250(
         values,
         scales,

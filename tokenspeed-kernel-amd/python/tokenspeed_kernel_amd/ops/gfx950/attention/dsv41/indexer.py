@@ -257,7 +257,8 @@ def gluon_dsv41_index_topk_gfx950(
         table_width * PAGE_SIZE,
     ).to(gl.int32)
     if CANDIDATES >= 0:
-        width = gl.where(vis > 0, CANDIDATES * 8, 0)
+        # Every candidate column is written, -inf when it maps to no row.
+        width = CANDIDATES * 8
     else:
         width = vis
     candidate_start = split * SCORE_CHUNK
@@ -353,10 +354,10 @@ def gluon_dsv41_index_topk_gfx950(
             CANDIDATES,
         )
         positions = tile_start + output_columns
-        live = positions < candidate_end
+        bound = positions < candidate_end
         _, _, live = _csa2_page_rows(
             positions,
-            live,
+            bound,
             page_table,
             candidates,
             token,
@@ -368,10 +369,12 @@ def gluon_dsv41_index_topk_gfx950(
             table_width,
             CANDIDATES,
         )
+        # Columns below the scored width that map to no row are written -inf,
+        # so callers need not pre-fill the logits.
         gl.store(
             logits + token * logits_stride + positions,
-            scores,
-            mask=(positions < max_candidates) & live,
+            gl.where(live, scores, -float("inf")),
+            mask=bound,
         )
 
 
@@ -508,8 +511,8 @@ def _qtile_score(
 def _qtile_store(logits, token, logits_stride, positions, bound, page_ok, scores):
     gl.store(
         logits + token * logits_stride + positions,
-        scores,
-        mask=(positions < bound) & page_ok,
+        gl.where(page_ok, scores, -float("inf")),
+        mask=positions < bound,
     )
 
 
@@ -755,7 +758,9 @@ def dsv41_index_logits_gfx950(
         table: Physical page IDs shaped [T, logical_pages].
         visible: Visible logical row counts shaped [T].
         candidates: Optional candidate block IDs shaped [T, blocks].
-        logits: FP32 destination shaped [T, scored_rows], initialized to -inf.
+        logits: FP32 destination shaped [T, scored_rows]. Every column below
+            a query's visible count (all columns with candidates) is written,
+            -inf where no cache row is scored; other columns are untouched.
         score_chunk_size: Positive multiple-of-eight upper bound on rows per CTA.
 
     Returns:

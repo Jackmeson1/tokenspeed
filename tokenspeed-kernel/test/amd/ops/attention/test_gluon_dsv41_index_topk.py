@@ -442,7 +442,15 @@ def test_index_topk_preserves_arena_page_stride(
     calls = []
 
     def check_page_view(
-        q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
+        values,
+        scales,
+        w,
+        cache_2d,
+        table,
+        visible,
+        candidates,
+        logits,
+        score_chunk_size,
     ):
         assert cache_2d.stride(1) == 1
         if byte_stride == 1 and not page_gap:
@@ -453,7 +461,8 @@ def test_index_topk_preserves_arena_page_stride(
             assert cache_2d.data_ptr() != cache.data_ptr()
         calls.append((cache_2d.shape, score_chunk_size))
         return launch(
-            q,
+            values,
+            scales,
             w,
             cache_2d,
             table,
