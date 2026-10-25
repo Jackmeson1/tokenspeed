@@ -1084,7 +1084,7 @@ def gluon_dsv41_index_topk_select_gfx950(
     width,
     topk,  # row_out width
     take,  # min(topk, width)
-    TOPK: gl.constexpr,  # power-of-two capacity >= topk, at least 256
+    TOPK: gl.constexpr,  # power-of-two capacity >= topk, at least 512
     HAS_CANDIDATES: gl.constexpr,
     HAS_LIMITS: gl.constexpr,
     RADIX_BITS: gl.constexpr,
@@ -1471,7 +1471,7 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         width,
         topk,
         min(topk, width),
-        TOPK=max(256, triton.next_power_of_2(topk)),
+        TOPK=max(512, triton.next_power_of_2(topk)),
         HAS_CANDIDATES=candidates is not None,
         HAS_LIMITS=live_widths is not None,
         RADIX_BITS=_SELECT_RADIX_BITS,
