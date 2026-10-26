@@ -126,7 +126,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     multimodal_context_for_forward,
 )
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
-from tokenspeed.runtime.pd.host_peer import build_host_peer
+from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
@@ -188,7 +188,7 @@ def rust_host_refusals(server_args: ServerArgs) -> list[str]:
     it can serve all of it."""
     refusals = []
     # An EPD encode server starts its ranks itself (``_start_encode_ranks``):
-    # they take encode requests, not the engine wire.
+    # they run no scheduler.
     if server_args.disaggregation_mode not in ("null", "prefill", "decode"):
         refusals.append(f"--disaggregation-mode {server_args.disaggregation_mode}")
     if kv_events_enabled(server_args.kv_events_config):
@@ -1136,6 +1136,11 @@ class HostBootstrap:
                 attn_tp_size=server_args.attn_tp_size or mapping.attn.tp_size,
                 dp_rank=dp_rank,
                 kv_cache_size_tokens=geometry.token_capacity,
+                bootstrap=(
+                    kv_bootstrap_address(server_args)
+                    if server_args.disaggregation_mode == "prefill"
+                    else None
+                ),
             )
             if (specs.expert_rebalance is None) == server_args.enable_eplb:
                 raise RuntimeError(

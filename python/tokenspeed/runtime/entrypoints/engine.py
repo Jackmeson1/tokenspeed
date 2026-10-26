@@ -58,7 +58,6 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 
 import torch
 import uvloop
-import zmq
 from tokenspeed_engine import BootstrapServer, FrontendListener
 
 from tokenspeed.runtime.cache.l3.identity import (
@@ -71,7 +70,6 @@ from tokenspeed.runtime.engine.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
-    IpcSender,
     RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -92,7 +90,6 @@ from tokenspeed.runtime.utils import (
     MultiprocessingSerializer,
     configure_logger,
     get_colorful_logger,
-    get_zmq_socket,
     launch_dummy_health_check_server,
     launch_metrics_server,
     prepare_model_and_tokenizer,
@@ -854,7 +851,7 @@ def _launch_subprocesses(
         scheduler_infos.append(data)
     frontend = pending_frontend.wait()
 
-    tokenizer_manager = AsyncLLM(server_args, frontend, None)
+    tokenizer_manager = AsyncLLM(server_args, frontend)
     tokenizer_manager.bootstrap_server = kv_bootstrap_server
     tokenizer_manager.metrics_relay = metrics_relay
     # Assume all schedulers have the same scheduler_info
@@ -880,8 +877,9 @@ def _start_encode_ranks(
 ) -> tuple[list, list]:
     """Start this node's EPD encode ranks, one ``ts-host`` process each in
     encode mode (``epd/encode_host.py``), and return them with their ready
-    pipes. The first rank binds the request channel
-    (``port_args.scheduler_input_ipc_name``)."""
+    pipes. The first rank dials the frontend's handshake
+    (``server_args.zmq_handshake_endpoint()``), which then sends it the
+    encode requests."""
     binary = host_binary()
     procs, readers = [], []
     for rank in _scheduler_ranks(server_args):
@@ -896,23 +894,35 @@ def _start_encode_ranks(
     return procs, readers
 
 
-def headless_encode_channel(server_args: ServerArgs) -> str:
-    """The request channel of a headless EPD encode server: the first encode
-    rank binds ``tcp://{--data-parallel-address}:{--data-parallel-rpc-port}``
-    and the external frontend pushes its ``EncodeRequest``s there."""
-    address = join_host_port(
-        server_args.data_parallel_address, server_args.data_parallel_rpc_port
-    )
-    return f"tcp://{address}"
-
-
 def _launch_encode_server(
     server_args: ServerArgs, port_args: PortArgs
 ) -> tuple[AsyncLLM, None, dict]:
     """An EPD encode server: its encode ranks (``ts-host`` in encode mode,
-    ``epd/encode_host.py``) and, on the first node, the frontend that pushes
+    ``epd/encode_host.py``) and, on the first node, the frontend that sends
     them encode requests. The ranks run the vision tower and ship embeddings
     to the prefill servers; no engine rank runs."""
+    pending_frontend = None
+    host, port = _frontend_addresses(server_args)
+    if server_args.node_rank == 0:
+        listener = FrontendListener.bind(
+            handshake_address=f"tcp://{join_host_port(host, port)}",
+            input_address=f"tcp://{join_host_port(host, 0)}",
+            output_address=f"tcp://{join_host_port(host, 0)}",
+            first_engine_index=server_args.zmq_engine_index,
+            num_engines=1,
+            routing="round_robin",
+            handshake_timeout_s=_FRONTEND_HANDSHAKE_TIMEOUT_S,
+            send_timeout_s=_FRONTEND_SEND_TIMEOUT_S,
+        )
+        bound_host, bound_port = listener.handshake_address[len("tcp://") :].rsplit(
+            ":", 1
+        )
+        server_args.data_parallel_address = bound_host.strip("[]")
+        server_args.data_parallel_rpc_port = int(bound_port)
+        pending_frontend = listener.accept()
+    else:
+        server_args.data_parallel_address = host
+        server_args.data_parallel_rpc_port = port
     procs, readers = _start_encode_ranks(server_args, port_args)
     infos = []
     for data in receive_ready_messages(readers, procs):
@@ -928,13 +938,7 @@ def _launch_encode_server(
             proc.join()
         return None, None, None
     launch_metrics_server(server_args)
-    # The first encode rank binds the request channel.
-    encode_sender = IpcSender(
-        get_zmq_socket(
-            zmq.Context(1), zmq.PUSH, port_args.scheduler_input_ipc_name, False
-        )
-    )
-    tokenizer_manager = AsyncLLM(server_args, None, encode_sender)
+    tokenizer_manager = AsyncLLM(server_args, pending_frontend.wait())
     _apply_scheduler_info(tokenizer_manager, infos[0])
     return tokenizer_manager, None, infos[0]
 
@@ -1024,9 +1028,8 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     its own engine identity, ``--zmq-engine-index`` plus its DP rank.
 
     An EPD encode server (``--disaggregation-mode encode``) starts its encode
-    ranks instead, and its first rank binds that address as its request
-    channel (``headless_encode_channel``): the frontend pushes
-    ``EncodeRequest``s to it.
+    ranks instead; their first rank dials the same address and takes encode
+    requests.
     """
     server_args.skip_tokenizer_init = True
 
@@ -1081,7 +1084,6 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         kv_bootstrap_server = _start_kv_bootstrap_server(server_args)
         if server_args.disaggregation_mode == "encode":
             # The encode ranks host the node's EPD bootstrap server themselves.
-            port_args.scheduler_input_ipc_name = headless_encode_channel(server_args)
             procs, readers = _start_encode_ranks(server_args, port_args)
         else:
             # Fail before any rank loads the model.
@@ -1102,16 +1104,10 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
                 raise RuntimeError(
                     "Scheduler initialization failed. See the error messages above."
                 )
-        if server_args.disaggregation_mode == "encode":
-            logger.info(
-                "headless encode rank(s) ready; request channel="
-                f"{port_args.scheduler_input_ipc_name}",
-            )
-        else:
-            logger.info(
-                "headless scheduler(s) ready; SMG handshake endpoint="
-                f"{server_args.zmq_handshake_endpoint()!s}",
-            )
+        logger.info(
+            "headless scheduler(s) ready; SMG handshake endpoint="
+            f"{server_args.zmq_handshake_endpoint()!s}",
+        )
 
         failed = _supervise_schedulers(
             scheduler_procs,

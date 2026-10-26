@@ -2014,6 +2014,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     self.register(std::mem::take(&mut admissions), outputs, released)?;
                     self.control(*request)?;
                 }
+                // The transport turns calls into operations and drops encode
+                // requests; a frontend that passes them on has nothing here.
+                EngineRequest::Call(_) | EngineRequest::Encode(_) => {
+                    tracing::warn!("dropping a message the scheduler does not take")
+                }
             }
         }
         self.outputs.sweep_pending_aborts();

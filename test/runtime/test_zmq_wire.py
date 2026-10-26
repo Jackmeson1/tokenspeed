@@ -213,3 +213,32 @@ def test_ready_response_is_map_encoded():
     raw_engine_ready = msgspec.msgpack.decode(zmq_wire.encode(engine_ready))
     assert raw_engine_ready["dtype"] == "float16"
     assert raw_engine_ready["multimodal_encoder_dtype"] == "bfloat16"
+
+
+def test_an_encode_server_registers_its_role_bootstrap_and_model_facts():
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    server_args = ServerArgs(model="m", disaggregation_mode="encode")
+    hf_config = PretrainedConfig(
+        architectures=["Qwen3_5ForConditionalGeneration"],
+        rope_scaling={"mrope_section": [11, 11, 10]},
+        vision_config={"spatial_merge_size": 2},
+        image_token_id=248056,
+        video_token_id=248057,
+    )
+    ready = zmq_wire.encode_ready_response(
+        server_args=server_args,
+        hf_config=hf_config,
+        dtype="bfloat16",
+        bootstrap=("10.0.0.9", 8998),
+    )
+    raw = msgspec.msgpack.decode(zmq_wire.encode(ready))
+    assert raw["disaggregation_mode"] == "encode"
+    assert (raw["bootstrap_host"], raw["bootstrap_port"]) == ("10.0.0.9", 8998)
+    assert raw["architectures"] == ["Qwen3_5ForConditionalGeneration"]
+    assert raw["mrope_positions"] is True
+    assert (raw["spatial_merge_size"], raw["image_token_id"]) == (2, 248056)
+    # The host declares the request types and layouts on top.
+    assert raw["request_types"] == [] and raw["positional_layouts"] == {}

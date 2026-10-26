@@ -41,8 +41,18 @@ frontend. Each rank dials the frontend's handshake socket; the in-process
 frontend is `tokenspeed_engine.Frontend` (`ts-py` over `ts-client`) under
 `AsyncLLM`. An EPD encode node's ranks run the host's encode mode instead
 (`ts-control`'s `encode` loop over `epd/encode_host.py`): no scheduler, no
-event loop. Their first rank binds the request channel its frontend pushes
-encode requests to; headless, that is the address an engine rank would dial.
+event loop. Their first rank dials the frontend the same way and takes
+encode requests.
+
+What an engine registers with tells its frontend what it serves: the
+request types it takes (an encode server takes encode requests only), the
+field order of the positional structs on its wire, its role and, for a
+prefill or encode server, where its bootstrap server listens, and the
+checkpoint facts a frontend computes multimodal positions from. A frontend
+may name a control operation by method (a control call, as SMG's gateway
+calls every scheduler it drives); the transport turns it into the engine's
+own operation and answers it under its call id once the operation's reply
+comes back, so the loop sees only its own operations.
 
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 

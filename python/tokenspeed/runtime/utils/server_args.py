@@ -4186,7 +4186,7 @@ class PortArgs:
     # The ipc filename for AsyncLLM to receive BatchTokenIDOut directly
     # from the scheduler (zmq).
     tokenizer_ipc_name: str
-    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
+    # Reserved in the port cluster; no process binds it.
     scheduler_input_ipc_name: str
 
     # The port for nccl initialization (torch.dist)

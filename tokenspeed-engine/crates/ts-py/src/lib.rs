@@ -221,15 +221,22 @@ struct Frontend {
 #[pymethods]
 impl Frontend {
     /// The engines, in index order: each one's index and the configuration
-    /// it registered with (`max_model_len`, `data_parallel_rank`, ...).
+    /// it registered with (`max_model_len`, `data_parallel_rank`,
+    /// `request_types`, `disaggregation_mode`, ...).
     fn engines<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let engines = PyList::empty(py);
         for engine in self.client.engines() {
+            let ready = &engine.ready;
             let info = PyDict::new(py);
             info.set_item("index", engine.index)?;
-            info.set_item("max_model_len", engine.ready.max_model_len)?;
-            info.set_item("data_parallel_rank", engine.ready.data_parallel_rank)?;
-            info.set_item("data_parallel_size", engine.ready.data_parallel_size)?;
+            info.set_item("max_model_len", ready.max_model_len)?;
+            info.set_item("data_parallel_rank", ready.data_parallel_rank)?;
+            info.set_item("data_parallel_size", ready.data_parallel_size)?;
+            info.set_item("kv_cache_size_tokens", ready.kv_cache_size_tokens)?;
+            info.set_item("request_types", ready.request_types.clone())?;
+            info.set_item("disaggregation_mode", ready.disaggregation_mode.clone())?;
+            info.set_item("bootstrap_host", ready.bootstrap_host.clone())?;
+            info.set_item("bootstrap_port", ready.bootstrap_port)?;
             engines.append(info)?;
         }
         Ok(engines)
@@ -304,6 +311,25 @@ impl Frontend {
                 batch.push(next);
             }
             Ok(Deliveries(batch))
+        })
+    }
+
+    /// Send an EPD encode server an item to embed, given as its wire frames
+    /// (an encoded `EncodeRequest`, without the type frame). Nothing answers;
+    /// awaiting this returns once the server has the request.
+    fn encode<'py>(&self, py: Python<'py>, frames: Vec<Vec<u8>>) -> PyResult<Bound<'py, PyAny>> {
+        let request = match EngineRequest::from_frames(&request_frames(
+            ts_wire::frames::REQ_TYPE_ENCODE,
+            frames,
+        ))
+        .map_err(engine_error)?
+        {
+            EngineRequest::Encode(request) => *request,
+            _ => unreachable!("the type frame names an encode request"),
+        };
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client.encode(request).await.map_err(engine_error)
         })
     }
 

@@ -55,7 +55,6 @@ from tokenspeed.runtime.engine.io_struct import (
     ConfigureLoggingReq,
     EmbeddingReqInput,
     GenerateReqInput,
-    IpcSender,
     MsgpackEncoder,
     OpenSessionReqInput,
     TokenizedEmbeddingReqInput,
@@ -108,20 +107,13 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
     inheritance declaration above.
     """
 
-    def __init__(
-        self,
-        server_args: ServerArgs,
-        frontend,
-        encode_sender: IpcSender | None,
-    ):
+    def __init__(self, server_args: ServerArgs, frontend):
         """
         Args:
             server_args: The engine's server arguments.
             frontend: The connected engine ranks
-                (``tokenspeed_engine.Frontend``); None on an EPD encode
-                server, which runs no engine ranks.
-            encode_sender: On an EPD encode server, the channel to its
-                encode ranks (``submit_encode``); None elsewhere.
+                (``tokenspeed_engine.Frontend``); on an EPD encode server,
+                its encode ranks (``submit_encode``).
         """
         # Parse args
         self.server_args = server_args
@@ -131,7 +123,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.logger = logger
 
         self.frontend = frontend
-        self._encode_sender = encode_sender
+        self._encode_server = server_args.disaggregation_mode == "encode"
+        # In-flight encode sends, so none is collected before it is done.
+        self._encode_sends: set[asyncio.Task] = set()
         self._wire_encoder = MsgpackEncoder()
         # The prefill role's KV bootstrap server, which the launcher starts;
         # closed with the engine.
@@ -278,7 +272,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
     ):
         if not isinstance(tokenized_obj, TokenizedGenerateReqInput):
             raise ValueError("this engine serves generate requests only")
-        if self.frontend is None:
+        if self._encode_server:
             raise ValueError("an EPD encode server serves no generate requests")
         sampling_params = tokenized_obj.sampling_params
         stop_strs = tuple(sampling_params.stop_strs or ())
@@ -338,16 +332,25 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
     def submit_encode(self, encode_request) -> None:
         """Send an EPD encode request to this encode server's ranks.
 
-        Fire-and-forget over the request channel the first encode rank binds
-        (``ts-host`` in encode mode, ``epd/encode_host.py``), which relays it
-        to the others. The ranks run the vision tower and ship the embedding
-        to prefill over Mooncake; the gateway gets no streamed response, only
+        Fire-and-forget to the first encode rank (``ts-host`` in encode mode,
+        ``epd/encode_host.py``), which dialed this frontend and relays it to
+        the others. The ranks run the vision tower and ship the embedding to
+        prefill over Mooncake; the gateway gets no streamed response, only
         the gRPC ack. ``encode_request`` is an ``encode_worker.EncodeRequest``
-        whose pixels ride the channel as tensors or shared-memory handles.
+        whose pixels ride as tensors or shared-memory handles. Called on the
+        event loop; the send runs as a task on it.
         """
-        if self._encode_sender is None:
+        if not self._encode_server:
             raise RuntimeError("only an EPD encode server runs encode ranks")
-        self._encode_sender.send_pyobj(encode_request)
+        frames = [bytes(frame) for frame in self._wire_encoder.encode(encode_request)]
+        task = asyncio.get_running_loop().create_task(self.frontend.encode(frames))
+        self._encode_sends.add(task)
+        task.add_done_callback(self._encode_sent)
+
+    def _encode_sent(self, task: asyncio.Task) -> None:
+        self._encode_sends.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(f"sending an encode request failed: {task.exception()!r}")
 
     async def _wait_one_response(
         self,
@@ -748,7 +751,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
     async def handle_loop(self):
         """Hand the engines' outputs to their requests, a batch per wakeup."""
-        if self.frontend is None:
+        if self._encode_server:
             return
         while True:
             outputs = await self.frontend.next_outputs()
