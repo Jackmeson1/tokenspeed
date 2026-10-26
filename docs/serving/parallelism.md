@@ -952,8 +952,6 @@ Before benchmarking:
 - confirm GPU visibility and process placement
 - compare output correctness before tuning throughput
 - keep the full launch command with benchmark results
-
-
 ## Prefill compute budget
 
 For attention-DP prefill, equal token counts can hide very different work:
@@ -988,7 +986,7 @@ or compute-aware ingress routing in this option. Under low load, smaller
 chunks can increase total steps and hurt latency. Compare throughput and
 TTFT as well as rank imbalance before enabling it for a workload.
 
-The [reproduction benchmark](../../tokenspeed-scheduler/benchmarks/README.md)
+The [reproduction benchmark](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-scheduler/benchmarks/README.md)
 compares identical token workloads with uniform contexts, mixed contexts and
 prefix-length skew. Model estimates and synchronized GPU component timings
 are reported separately.
