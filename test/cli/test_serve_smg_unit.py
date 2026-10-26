@@ -52,11 +52,12 @@ from tokenspeed.cli.serve_smg import (
     MUSE_SPARK_GRAMMAR_BACKEND,
     MUSE_SPARK_REASONING_PARSER,
     MUSE_SPARK_TOOL_CALL_PARSER,
+    EngineLayout,
     ServeConfigError,
     _add_metrics_port,
     _args_with_default_model_parsers,
     _declares_response_template,
-    _engine_count,
+    _engine_layout,
     _free_port_avoiding_ephemeral_range,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
@@ -921,7 +922,9 @@ def _release_after_ready(startup_done: asyncio.Event):
     return step
 
 
-async def _run(engine, gateway, *, probe, engine_count=1, terminate=None, **overrides):
+async def _run(
+    engine, gateway, *, probe, layout=EngineLayout(1, None), terminate=None, **overrides
+):
     """``run_smg`` with both spawns, the probe and teardown patched; returns
     its exit code and the spawn mocks."""
     spawn_engine = AsyncMock(return_value=engine)
@@ -932,7 +935,7 @@ async def _run(engine, gateway, *, probe, engine_count=1, terminate=None, **over
         "opts": OrchestratorOpts(engine_startup_timeout=10, gateway_startup_timeout=10),
         "user_host": "127.0.0.1",
         "user_port": 8000,
-        "engine_count": engine_count,
+        "layout": layout,
         **overrides,
     }
     with patch("tokenspeed.cli.serve_smg.spawn_engine", spawn_engine), patch(
@@ -1023,7 +1026,7 @@ async def test_gateway_starts_first_and_stops_first():
             ),
             user_host="127.0.0.1",
             user_port=8000,
-            engine_count=1,
+            layout=EngineLayout(1, None),
         )
     assert rc == 0
     assert order == [
@@ -1051,15 +1054,37 @@ async def test_engine_dials_the_gateways_handshake(engine_count):
         engine,
         gateway,
         probe=_probe(readiness=_release_after_ready(startup_done)),
-        engine_count=engine_count,
+        layout=EngineLayout(engine_count, None),
     )
     assert rc == 0
     worker_url = spawn_gateway.await_args.kwargs["worker_url"]
     assert worker_url.startswith("ipc://")
     assert spawn_gateway.await_args.kwargs["engine_count"] == engine_count
-    assert spawn_engine.await_args.kwargs["handshake_port"] == zmq_handshake_port(
-        worker_url
+    assert spawn_engine.await_args.kwargs["handshake"] == (
+        "127.0.0.1",
+        zmq_handshake_port(worker_url),
     )
+
+
+@pytest.mark.asyncio
+async def test_ranks_on_other_nodes_dial_a_tcp_worker():
+    """When replica leaders sit on other nodes, the gateway's worker is the
+    tcp:// address they reach, and the engine dials it too."""
+    engine = _make_proc(returncode=0)
+    gateway = _make_proc(returncode=0)
+    startup_done = asyncio.Event()
+    _children_until(startup_done, engine, gateway)
+
+    rc, spawn_engine, spawn_gateway = await _run(
+        engine,
+        gateway,
+        probe=_probe(readiness=_release_after_ready(startup_done)),
+        layout=EngineLayout(4, ("10.0.0.5", 23455)),
+    )
+    assert rc == 0
+    assert spawn_gateway.await_args.kwargs["worker_url"] == "tcp://10.0.0.5:23455"
+    assert spawn_gateway.await_args.kwargs["engine_count"] == 4
+    assert spawn_engine.await_args.kwargs["handshake"] == ("10.0.0.5", 23455)
 
 
 @pytest.mark.asyncio
@@ -1166,7 +1191,7 @@ async def test_signal_handlers_installed_before_spawning_anything():
                 opts=OrchestratorOpts(),
                 user_host="127.0.0.1",
                 user_port=8000,
-                engine_count=1,
+                layout=EngineLayout(1, None),
             )
 
     spawn_idx = call_order.index("spawn_gateway")
@@ -1354,36 +1379,37 @@ def llama_dir(tmp_path):
         ),
     ],
 )
-def test_engine_count_is_the_attention_dp_size(llama_dir, layout, engines):
-    assert _engine_count(["--model", llama_dir, *layout]) == engines
+def test_the_engine_count_is_the_attention_dp_size(llama_dir, layout, engines):
+    assert _engine_layout(["--model", llama_dir, *layout]) == EngineLayout(
+        engines, None
+    )
 
 
-@pytest.mark.parametrize(
-    "layout, reason",
-    [
-        (["--disaggregation-mode", "prefill"], "disaggregation-mode prefill"),
-        (
-            [
-                "--attn-tp-size",
-                "2",
-                "--data-parallel-size",
-                "2",
-                "--nnodes",
-                "2",
-                "--node-rank",
-                "0",
-                "--dist-init-addr",
-                "127.0.0.1:23456",
-            ],
-            r"led by ranks \[2\]",
-        ),
-    ],
-)
-def test_engine_count_refuses_what_the_direct_lane_cannot_serve(
-    llama_dir, layout, reason
-):
-    with pytest.raises(ServeConfigError, match=reason):
-        _engine_count(["--model", llama_dir, *layout])
+def test_replica_leaders_on_other_nodes_dial_below_the_dist_init_port(llama_dir):
+    # Two replicas of two ranks each, one per node: rank 2 leads the second
+    # from node 1, so the gateway's handshake listens on the head's address.
+    layout = _engine_layout(
+        [
+            "--model",
+            llama_dir,
+            "--attn-tp-size",
+            "2",
+            "--data-parallel-size",
+            "2",
+            "--nnodes",
+            "2",
+            "--node-rank",
+            "0",
+            "--dist-init-addr",
+            "127.0.0.1:23456",
+        ]
+    )
+    assert layout == EngineLayout(2, ("127.0.0.1", 23455))
+
+
+def test_a_disaggregated_role_is_refused(llama_dir):
+    with pytest.raises(ServeConfigError, match="disaggregation-mode prefill"):
+        _engine_layout(["--model", llama_dir, "--disaggregation-mode", "prefill"])
 
 
 def test_run_smg_from_args_sets_process_title(monkeypatch):
@@ -1397,7 +1423,9 @@ def test_run_smg_from_args_sets_process_title(monkeypatch):
     monkeypatch.setattr(
         "tokenspeed.cli.serve_smg._check_serve_extra_installed", lambda: None
     )
-    monkeypatch.setattr("tokenspeed.cli.serve_smg._engine_count", lambda _: 1)
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._engine_layout", lambda _: EngineLayout(1, None)
+    )
     fake_setproctitle = type(
         "M", (), {"setproctitle": lambda title: captured.setdefault("title", title)}
     )
@@ -1429,7 +1457,9 @@ def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):
         "tokenspeed.cli.serve_smg._prewarm_hf_tokenizer", lambda _: None
     )
     monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg", fake_run_smg)
-    monkeypatch.setattr("tokenspeed.cli.serve_smg._engine_count", lambda _: 1)
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._engine_layout", lambda _: EngineLayout(1, None)
+    )
 
     from argparse import Namespace
 
@@ -1470,7 +1500,9 @@ def test_run_smg_from_args_applies_muse_spark_defaults(monkeypatch):
         "tokenspeed.cli.serve_smg._prewarm_hf_tokenizer", lambda _: None
     )
     monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg", fake_run_smg)
-    monkeypatch.setattr("tokenspeed.cli.serve_smg._engine_count", lambda _: 1)
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._engine_layout", lambda _: EngineLayout(1, None)
+    )
 
     from argparse import Namespace
 
@@ -1731,7 +1763,9 @@ def _run_smg_from_args_with(monkeypatch, argv, prewarm):
     )
     monkeypatch.setattr("tokenspeed.cli.serve_smg._prewarm_hf_tokenizer", prewarm)
     monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg", fake_run_smg)
-    monkeypatch.setattr("tokenspeed.cli.serve_smg._engine_count", lambda _: 1)
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._engine_layout", lambda _: EngineLayout(1, None)
+    )
 
     from argparse import Namespace
 

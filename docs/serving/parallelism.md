@@ -474,8 +474,9 @@ replicas live on other ranks.
 
    Start a profile with the `EXPERT_LOAD` activity and an `output_dir` (the
    engine's `ProfileReq` control operation, which the frontend driving the
-   engine sends; `ts serve`'s gateway does not forward it), serve the
-   workload, then stop the profile.
+   engine sends; under `ts serve`, the gateway's `POST /start_profile` with
+   `{"activities": ["EXPERT_LOAD"], "output_dir": ...}`), serve the
+   workload, then stop the profile (`POST /stop_profile`).
 
    Stopping writes one record per rank,
    `<id>-<rank tag>.expert-load.pt`, holding what *that rank's* router
@@ -803,11 +804,13 @@ Each node must use the same model, backend, precision, and scheduler settings.
 Only `--node-rank` should differ between nodes.
 
 Run one `tokenspeed serve` per node. Node rank 0 serves the HTTP API. Higher
-ranks run the engine only and expose no endpoint. The bundled gateway reaches
-the engine over a same-host lane, so with attention DP every replica's first
-rank must be on node 0; `tokenspeed serve` refuses a layout that puts one on
-another node. Serve such a layout with `tokenspeed serve --headless` on every
-node behind a frontend that reaches remote engines.
+ranks run the engine only and expose no endpoint. Each attention-DP replica's
+first rank registers with node 0's bundled gateway: over a same-host socket
+when every one of them is on node 0, otherwise over TCP. The gateway then
+listens on the host of `--dist-init-addr`, at the port below its, which every
+node derives from its own flags, so keep that port free on node 0 and
+reachable from the other nodes. These sockets carry no authentication: run
+the nodes on a trusted network.
 
 ### Under a launcher
 

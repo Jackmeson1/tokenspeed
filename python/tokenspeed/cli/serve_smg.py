@@ -24,9 +24,12 @@ logs, probe readiness, and tear down gateway-first on shutdown.
 ``ts serve`` is the full serving command: SMG's gateway in front of the
 engine on SMG's direct ZMQ lane, Rust to Rust. The gateway tokenizes, renders
 and parses; it binds the engine's sockets, and the engine's ranks dial in
-(``tokenspeed.cli._proc``). The lane is same-host and serves one regular
-worker, so ``ts serve`` refuses a disaggregated role and an attention-DP
-replica whose first rank sits on another node (``_engine_count``).
+(``tokenspeed.cli._proc``). ``ts serve`` fronts one regular engine, so it
+refuses a disaggregated role (``_engine_layout``): run each role with ``ts
+serve --headless`` behind ``smg launch`` in disaggregated mode. Its sockets
+are same-host ``ipc://`` unless an attention-DP replica's first rank sits on
+another node; then the gateway binds them on ``--dist-init-addr``'s host
+(``tcp://``), and every node's ranks dial the port below that address's.
 
 ``ts serve --headless`` is engine-only: nothing else is spawned here — an
 external frontend such as ``smg serve --backend tokenspeed --connection-mode
@@ -49,6 +52,7 @@ import argparse
 import asyncio
 import contextlib
 import copy
+import dataclasses
 import json
 import logging
 import os
@@ -74,7 +78,7 @@ from tokenspeed.cli._proc import (
     zmq_socket_dir,
 )
 from tokenspeed.runtime.utils.launcher import _ephemeral_port_range, detect_topology
-from tokenspeed.runtime.utils.network import get_free_port
+from tokenspeed.runtime.utils.network import get_free_port, join_host_port
 from tokenspeed.runtime.utils.process import kill_process_tree
 
 logger = logging.getLogger(__name__)
@@ -783,16 +787,30 @@ class ServeConfigError(Exception):
     """An engine configuration ``ts serve`` cannot front."""
 
 
-def _engine_count(engine_args: list[str]) -> int:
-    """The engine's attention-DP ranks: each one registers with the gateway
-    as an engine of its one worker.
+@dataclasses.dataclass(frozen=True)
+class EngineLayout:
+    """What the gateway awaits of the engine.
+
+    Attributes:
+        count: The attention-DP ranks, each of which registers with the
+            gateway as an engine of its one worker.
+        remote_handshake: Where the gateway's handshake listens when some
+            replica's first rank, the one that registers, sits on another
+            node: ``(host, port)``, the host of ``--dist-init-addr`` and the
+            port below its, which every node derives the same. None when
+            every registering rank is on this node (an ``ipc://`` worker).
+    """
+
+    count: int
+    remote_handshake: tuple[str, int] | None
+
+
+def _engine_layout(engine_args: list[str]) -> EngineLayout:
+    """The engine's ``EngineLayout``.
 
     Resolves the engine's ``ServerArgs`` as the engine will (quietly: the
-    engine logs them itself) and refuses what SMG's direct lane cannot serve
-    before any process starts: a disaggregated role, since the lane serves
-    one regular worker and carries no KV-transfer rendezvous, and an
-    attention-DP replica whose first rank, the one that registers, sits on
-    another node, since the lane's sockets are loopback and ``ipc://``.
+    engine logs them itself) and refuses a disaggregated role before any
+    process starts: ``ts serve`` fronts one regular engine.
     """
     from tokenspeed.runtime.utils.server_args import prepare_server_args
 
@@ -805,11 +823,10 @@ def _engine_count(engine_args: list[str]) -> int:
         raise ServeConfigError(
             f"--disaggregation-mode {server_args.disaggregation_mode}: ts serve "
             "fronts one regular engine; run each disaggregated role with "
-            "`ts serve --headless` behind a frontend that routes "
-            "disaggregated requests"
+            "`ts serve --headless` behind `smg launch` in disaggregated mode"
         )
     mapping = server_args.mapping
-    remote = set()
+    remote = False
     for rank in range(mapping.world_size):
         rank_mapping = copy.deepcopy(mapping)
         rank_mapping.rank = rank
@@ -819,17 +836,14 @@ def _engine_count(engine_args: list[str]) -> int:
             if rank_mapping.has_pp
             else rank_mapping.attn.tp_group[0]
         )
-        if first >= mapping.nprocs_per_node:
-            remote.add(first)
+        remote = remote or first >= mapping.nprocs_per_node
+    remote_handshake = None
     if remote and not server_args.emulate_rank_zero:
-        raise ServeConfigError(
-            f"attention-DP replicas led by ranks {sorted(remote)} start on "
-            "other nodes than the gateway, and SMG's direct lane reaches its "
-            "engines on this host only; place every replica's first rank on "
-            "node 0, or run `ts serve --headless` behind a frontend that "
-            "reaches remote engines"
-        )
-    return mapping.attn.dp_size
+        host, port = server_args.dist_init_addr.rsplit(":", 1)
+        # The engine derives its port cluster upward from this port on every
+        # node, so the one below it is free of that cluster.
+        remote_handshake = (host.strip("[]"), int(port) - 1)
+    return EngineLayout(count=mapping.attn.dp_size, remote_handshake=remote_handshake)
 
 
 async def _stream_to(proc, tag: str) -> None:
@@ -891,7 +905,7 @@ async def run_smg(
     opts: OrchestratorOpts,
     user_host: str,
     user_port: int,
-    engine_count: int,
+    layout: EngineLayout,
     _stop_event: asyncio.Event | None = None,
 ) -> int:
     """Lifecycle loop. Returns the orchestrator's exit code.
@@ -920,7 +934,14 @@ async def run_smg(
         # Seeds the engine's derived ports (its torch.distributed store, ...)
         # and names its worker socket, apart from other instances on the host.
         engine_port = _free_port_avoiding_ephemeral_range()
-        worker_url = _zmq_worker_url(engine_port)
+        if layout.remote_handshake is not None:
+            # Ranks on other nodes register: the gateway binds its handshake
+            # where they reach it, and its data plane on the same host.
+            handshake = layout.remote_handshake
+            worker_url = f"tcp://{join_host_port(*handshake)}"
+        else:
+            worker_url = _zmq_worker_url(engine_port)
+            handshake = (ZMQ_LOOPBACK_HOST, zmq_handshake_port(worker_url))
 
         # Wire the engine metrics port when Prometheus reporting is enabled.
         engine_args, metrics_url = _add_metrics_port(engine_args)
@@ -929,7 +950,7 @@ async def run_smg(
         # _gateway_args_with_default_prometheus_port for why earlier is racy.
         gateway_args = _gateway_args_with_default_prometheus_port(gateway_args)
         gateway = await spawn_gateway(
-            gateway_args, worker_url=worker_url, engine_count=engine_count
+            gateway_args, worker_url=worker_url, engine_count=layout.count
         )
         gateway_log = asyncio.create_task(_stream_to(gateway, GATEWAY_TAG))
 
@@ -946,7 +967,7 @@ async def run_smg(
             engine_args,
             host="127.0.0.1",
             port=engine_port,
-            handshake_port=zmq_handshake_port(worker_url),
+            handshake=handshake,
         )
         engine_log = asyncio.create_task(_stream_to(engine, ENGINE_TAG))
 
@@ -1080,12 +1101,12 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     user_host = _get_from_args(gateway_args, "--host", DEFAULT_GATEWAY_HOST)
     user_port = int(_get_from_args(gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)))
 
+    try:
+        layout = _engine_layout(engine_args)
+    except ServeConfigError as error:
+        sys.stderr.write(f"ts serve: {error}\n")
+        sys.exit(2)
     if node_rank == 0:
-        try:
-            engine_count = _engine_count(engine_args)
-        except ServeConfigError as error:
-            sys.stderr.write(f"ts serve: {error}\n")
-            sys.exit(2)
         rc = asyncio.run(
             run_smg(
                 engine_args=engine_args,
@@ -1093,16 +1114,19 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
                 opts=split.opts,
                 user_host=user_host,
                 user_port=user_port,
-                engine_count=engine_count,
+                layout=layout,
             )
         )
         sys.exit(rc)
     else:
-        # A follower node runs no gateway and none of its ranks registers
-        # with one (``_engine_count`` refuses that on node 0): it runs the
-        # engine's ranks alone.
+        # A follower node runs no gateway: it runs the engine's ranks alone,
+        # whose replica leaders register with node 0's gateway over its
+        # tcp:// handshake when there are any here.
         argv = engine_argv(
-            engine_args, host=user_host, port=user_port, handshake_port=None
+            engine_args,
+            host=user_host,
+            port=user_port,
+            handshake=layout.remote_handshake,
         )
         logger.info(f"follower node: exec {' '.join(argv)}")
         sys.stdout.flush()

@@ -502,12 +502,15 @@ ranks over the wire only. Four deviations from the plan above:
   (`entrypoints/wire_driver.py`), on token ids and with the Python encoding
   of requests (`zmq_wire`); tokenization, detokenization, stop strings and
   `n > 1` fan-out are the frontends'.
-* `ts serve` runs on SMG's direct msgpack lane, which does not yet carry
-  everything the servicer did: prefill/decode and encode roles, MRoPE
-  multimodal inputs, shared-memory features, top-k and prompt logprobs, and
-  engines on another host than the gateway. `ts serve` refuses the roles and
-  the remote engines, and the gateway refuses the requests. Until SMG
-  carries them, they run as headless engines behind a frontend that does.
+* `ts serve` runs on SMG's direct msgpack lane, which carries what the
+  servicer did through the wire revision the ranks declare at the handshake:
+  prefill/decode and encode roles (`smg launch` in disaggregated mode over
+  headless engines; `ts serve` fronts one regular engine), MRoPE positions
+  the gateway computes from the model facts the engines declare, top-k and
+  prompt logprobs, engines on other hosts over a `tcp://` worker, and the
+  control and RL operations as control calls. Not carried: shared-memory
+  features (tensors travel inline) and the frontend-held weight version
+  (`get_weight_version`).
 * The control thread calls into Python for the data plane's completion
   queries, and only for those: it waits on a launched forward's copy event
   through the torch event the data plane records (vendor-neutral, as the

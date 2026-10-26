@@ -22,9 +22,11 @@
 
 ``ts serve`` runs SMG's gateway in front of a headless engine on SMG's direct
 ZMQ lane: the gateway binds the engine's sockets and the engine ranks dial
-in. The gateway derives every socket from the worker's ``ipc://`` URL — the
-data plane under its path and the TCP handshake on a loopback port hashed
-from it (``zmq_handshake_port``) — so the engine only needs that port.
+in. The gateway derives every socket from the worker's URL: for an ``ipc://``
+URL the data plane under its path and the TCP handshake on a loopback port
+hashed from it (``zmq_handshake_port``); for a ``tcp://`` URL, which serves
+ranks on other nodes, the handshake at the URL itself. Either way the engine
+only needs the handshake's address.
 """
 
 from __future__ import annotations
@@ -66,7 +68,7 @@ def zmq_handshake_port(worker_url: str) -> int:
 
 
 def engine_argv(
-    args: list[str], *, host: str, port: int, handshake_port: int | None
+    args: list[str], *, host: str, port: int, handshake: tuple[str, int] | None
 ) -> list[str]:
     """Build the command line that runs the headless engine.
 
@@ -74,20 +76,21 @@ def engine_argv(
         args: Engine-side arguments to forward verbatim.
         host: The engine's ``--host``.
         port: The engine's ``--port``, which seeds its derived ports.
-        handshake_port: The gateway's handshake port, on loopback; None on a
-            follower node, whose ranks never register with the gateway.
+        handshake: The gateway's handshake address ``(host, port)``; None on
+            a follower node none of whose ranks registers with the gateway.
 
     Returns:
         An ``argv`` list whose first element is the Python interpreter.
     """
     module = os.environ.get("TS_SERVE_ENGINE_MODULE", _ENGINE_MODULE_DEFAULT)
     argv = [sys.executable, "-m", module, "--host", host, "--port", str(port), *args]
-    if handshake_port is not None:
+    if handshake is not None:
+        handshake_host, handshake_port = handshake
         # Last, so they win over anything in ``args``: the gateway owns the
         # handshake, and its engine identities count from 0.
         argv += [
             "--data-parallel-address",
-            ZMQ_LOOPBACK_HOST,
+            handshake_host,
             "--data-parallel-rpc-port",
             str(handshake_port),
             "--zmq-engine-index",
@@ -101,10 +104,11 @@ async def spawn_engine(
     *,
     host: str,
     port: int,
-    handshake_port: int,
+    handshake: tuple[str, int],
 ) -> asyncio.subprocess.Process:
-    """Spawn the headless engine with PIPE stdio."""
-    cmd = engine_argv(args, host=host, port=port, handshake_port=handshake_port)
+    """Spawn the headless engine with PIPE stdio, its ranks dialing the
+    gateway's ``handshake`` ``(host, port)``."""
+    cmd = engine_argv(args, host=host, port=port, handshake=handshake)
     logger.info(f"spawn engine: {' '.join(cmd)}")
     return await asyncio.create_subprocess_exec(
         *cmd,

@@ -146,8 +146,10 @@ the sampled tokens' logprobs with their ids (`output_token_logprobs_val` and
   logprob of each following prompt token given its prefix. `s >= len(input_ids)`
   is a 400.
 
-`ts serve`'s gateway (SMG's direct lane) carries the sampled tokens' logprobs
-only.
+`ts serve`'s gateway (SMG's direct lane) carries the sampled tokens'
+logprobs, the prompt logprobs and the top candidates the engine computes;
+which of its routes renders them is the gateway's (`/generate` returns the
+prompt logprobs, chat completions the candidates).
 
 The engine computes prompt logprobs with the same fp32 log-softmax as the
 output logprobs (see `docs/design/numerics.md`), accumulates them across
@@ -191,9 +193,7 @@ frame carries `input_token_logprobs` (and the bootstrap token under
 node forwards the bootstrap token's logprob to the decode node, so the decode
 node's `output_token_logprobs` covers every generated token. Merging the two
 into one response is the router's job: it joins the prefill node's prompt
-logprobs with the decode node's output, just as it does for SGLang. SMG's
-direct lane refuses a `logprob_start_len` that would produce prompt logprobs
-rather than compute and drop them.
+logprobs with the decode node's output, just as it does for SGLang.
 
 `top_logprobs_num=k` (1 to 20) adds each position's `k` most likely tokens,
 most likely first, as `(logprob, token_id)` pairs: `input_top_logprobs`
@@ -203,8 +203,8 @@ values. The engine computes them where the forward runs eagerly, so the
 ingress takes `top_logprobs_num` only for a request whose every token is
 sampled in its prefill (`max_new_tokens` 0 or 1, as an `echo` scoring request
 sends) and with `--logprob-order torch`; a longer generation, pipeline
-parallelism and disaggregated prefill and decode get a 400, and SMG's direct
-lane refuses it. `token_ids_logprob` is not supported yet.
+parallelism and disaggregated prefill and decode get a 400.
+`token_ids_logprob` is not supported yet.
 
 This runtime requires a `tokenspeed-scheduler` build that has
 `RequestSpec.max_cached_prefix_tokens` (the admission-probe bound; see
@@ -229,8 +229,19 @@ engine's client library (`ts-client`, or its Python binding,
 - memory control: `ReleaseMemoryOccupationReqInput` and
   `ResumeMemoryOccupationReqInput`.
 
-TokenSpeed serves no HTTP route for them, and `ts serve`'s gateway (SMG's
-direct lane) forwards none. Attention data parallelism of any size is
+TokenSpeed serves no HTTP route for them. `ts serve`'s gateway (SMG's direct
+lane) serves them under its `/v1/rl` routes (`--enable-rl`), with the
+SGLang-compatible route names and bodies: each POST route is a control call
+of the same name on every engine of the worker, its JSON body the call's
+argument, read with the route's field names and defaults
+(`ts-control/src/calls.rs`): `pause_generation`, `continue_generation`,
+`init_weights_update_group`, `destroy_weights_update_group`,
+`update_weights_from_distributed`, `update_weights_from_disk`,
+`update_weights_from_mooncake`, `release_memory_occupation`,
+`resume_memory_occupation`, `rebalance_experts` and `flush_cache`. The GET
+routes, such as `get_weight_version`, have no call, and a response's
+`weight_version` stays the one the engine registered with. Attention data
+parallelism of any size is
 supported: the scheduler completes an operation only in a round where every
 DP rank holds it (see
 [Weight updates under attention DP](#weight-updates-under-attention-dp)).

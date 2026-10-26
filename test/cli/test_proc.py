@@ -108,26 +108,24 @@ def test_handshake_port_matches_the_gateways_derivation():
 
 def test_engine_argv_dials_the_handshake_last(monkeypatch):
     """The handshake flags come last, so they win over the operator's; a
-    follower node's engine gets none."""
+    follower node none of whose ranks registers gets none."""
     monkeypatch.delenv("TS_SERVE_ENGINE_MODULE", raising=False)
     argv = engine_argv(
         ["--model", "/m", "--data-parallel-rpc-port", "30500"],
         host="127.0.0.1",
         port=31000,
-        handshake_port=25152,
+        handshake=("10.0.0.5", 23455),
     )
     assert argv[1:3] == ["-m", "tokenspeed.runtime.entrypoints.engine"]
     assert argv[-6:] == [
         "--data-parallel-address",
-        "127.0.0.1",
+        "10.0.0.5",
         "--data-parallel-rpc-port",
-        "25152",
+        "23455",
         "--zmq-engine-index",
         "0",
     ]
-    follower = engine_argv(
-        ["--model", "/m"], host="0.0.0.0", port=8000, handshake_port=None
-    )
+    follower = engine_argv(["--model", "/m"], host="0.0.0.0", port=8000, handshake=None)
     assert follower[3:] == ["--host", "0.0.0.0", "--port", "8000", "--model", "/m"]
 
 
