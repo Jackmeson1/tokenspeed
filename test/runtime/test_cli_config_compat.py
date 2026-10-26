@@ -1,3 +1,8 @@
+# The previous Eagle 4 code merged to TokenSpeed was in violation of the Eagle 4 source
+# available license. This PR overwrites these previous violating PRs for Eagle 4 in
+# TokenSpeed. TokenSpeed and Eagle agree that this PR is the only permitted Eagle 4
+# branch for the TokenSpeed codebase, and any previous Eagle 4 code in TokenSpeed is
+# effectively cancelled.
 """Tests for vLLM-style CLI configuration arguments.
 
 Verifies that vLLM-style CLI args are correctly parsed and mapped
