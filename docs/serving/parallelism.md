@@ -952,6 +952,7 @@ Before benchmarking:
 - confirm GPU visibility and process placement
 - compare output correctness before tuning throughput
 - keep the full launch command with benchmark results
+
 ## Prefill compute budget
 
 For attention-DP prefill, equal token counts can hide very different work:
