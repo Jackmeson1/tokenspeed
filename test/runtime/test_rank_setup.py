@@ -95,6 +95,30 @@ def test_an_engine_without_l3_passes_no_prefetch_threshold():
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == (5, 8)
 
 
+def test_tree_lane_headroom_keeps_the_scheduler_verify_width():
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        speculative_algorithm="EAGLE3",
+        speculative_eagle_topk=4,
+        speculative_num_steps=10,
+        speculative_num_draft_tokens=16,
+    )
+    cfg = scheduler_config_from_args(
+        args,
+        _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0),
+        storage_config=None,
+        max_scheduled_tokens=args.chunked_prefill_size,
+        max_batch_size=8,
+        decode_input_tokens=16,
+        overlap_schedule_depth=1,
+        enable_kv_cache_events=False,
+        prefix_replay_tokens=0,
+    )
+    assert cfg.decode_input_tokens == 16
+    assert cfg.spec_draft_headroom == 36
+
+
 def test_an_engine_with_l3_passes_its_prefetch_threshold():
     args = ServerArgs(model="x", max_num_seqs=8, kvstore_storage_backend="memory")
     cfg = _config(

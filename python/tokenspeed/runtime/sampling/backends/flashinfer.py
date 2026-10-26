@@ -63,6 +63,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     slice_dp_vocab_mask,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     gather_token_logprobs,
@@ -74,7 +75,11 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+    from tokenspeed.runtime.sampling.tree_verify import (
+        TreeSampler,
+        TreeSamplerFactory,
+        TreeVerifyBatch,
+    )
 
 
 # Greedy requests normalize to top_k=1 and ride the pool route, whose
@@ -168,6 +173,7 @@ class FlashInferSamplingBackend(SamplingBackend):
     """
 
     _HAS_POOL_STATE = True
+    supports_tree_sampler = True
     _SUPPORTS_DP_VERIFY = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
@@ -176,6 +182,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
+        self._tree_sampler: TreeSampler | None = None
         if _FUSED_TOPK_TOPP_AVAILABLE:
             # Pre-create the fused renorm side stream: cudaStreamCreate is
             # illegal inside capture, and verify() runs from the captured graph.
@@ -596,7 +603,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 sampling_info.req_pool_indices,
                 temperature=self._temperature_pool,
                 top_k=self._top_k_pool,
-            top_p=self._top_p_pool,
                 top_p=self._top_p_pool,
                 seed=self._seed_pool,
                 offsets=self._prepare_sampling_offsets(sampling_info),
@@ -648,9 +654,11 @@ class FlashInferSamplingBackend(SamplingBackend):
         tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if tree is not None:
-            raise NotImplementedError(
-                f"{type(self).__name__} cannot verify draft trees"
-            )
+            if self._tree_sampler is None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} cannot verify draft trees"
+                )
+            return self._verify_tree(logits_output, sampling_info, candidates, tree)
 
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
@@ -783,7 +791,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 pool_indices,
                 temperature=self._temperature_pool,
                 top_k=self._top_k_pool,
-            top_p=self._top_p_pool,
                 top_p=self._top_p_pool,
                 n=n,
             )
@@ -893,6 +900,55 @@ class FlashInferSamplingBackend(SamplingBackend):
                 logits, predict, logprob_order=self.config.logprob_order
             )
 
+        return predict, accept_length
+
+    def bind_tree_sampler(self, factory: TreeSamplerFactory) -> None:
+        if not self.supports_tree_sampler:
+            return super().bind_tree_sampler(factory)
+        if self._tree_sampler is not None:
+            raise RuntimeError("Bind a tree sampler only once, before graph capture")
+        self._tree_sampler = factory(
+            self.speculative_sampling_pools(), self._dp_max_pad_bs, self.config.device
+        )
+        self.supports_tree_verify = True
+        self.verifies_draft_tree_q = True
+
+    def _verify_tree(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        candidates: torch.Tensor,
+        tree: TreeVerifyBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the bound sampler and publish its accepted path on every rank."""
+        if logits_output.logits_layout_plan is not None:
+            raise NotImplementedError("draft trees take no DP sampling")
+        bs, n = candidates.shape
+        row0 = sampling_info.batch_row_offset
+        logits = logits_output.next_token_logits
+        predict = self._predict_buf[: bs * n]
+        path = self._accept_index_buf[: bs * n].view(bs, n)
+        accept_length = self._accept_length_buf[:bs]
+        assert self._tree_sampler is not None
+        self._tree_sampler(
+            logits,
+            candidates,
+            tree,
+            sampling_info.req_pool_indices,
+            coins=self._coins_buf[row0 : row0 + bs, :n],
+            final_coins=self._final_coins_buf[row0 : row0 + bs],
+            path=path,
+            predict=predict,
+            accept_length=accept_length,
+        )
+        # Rank 0's outputs win: the renorm is not bit-identical across ranks.
+        self.broadcast_verify_outputs()
+        if self.config.enable_output_logprobs:
+            # predict is packed along the path; score it against the path's own rows.
+            path_logits = logits.index_select(0, accepted_path_rows(path))
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                path_logits, predict, logprob_order=self.config.logprob_order
+            )
         return predict, accept_length
 
     def get_packed_output_d2h(

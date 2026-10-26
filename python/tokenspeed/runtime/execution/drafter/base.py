@@ -21,8 +21,9 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
@@ -110,6 +111,27 @@ class BaseDrafter:
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """Take a replacement pool; a drafter that caches views rebuilds them."""
         self.token_to_kv_pool = token_to_kv_pool
+
+    def configure_algorithm(self, algorithm_config: Mapping[str, Any]) -> None:
+        """Take the launch's ``--speculative-algorithm-config``.
+
+        Called once by ``ModelExecutor`` right after construction, before
+        ``wire_target``, ``bind_sampling_backend`` and ``bind_tree``, and only
+        when the launch passed a config. Server arguments refuse the flag for
+        the in-tree algorithms, so only a plugin drafter receives one. The
+        default refuses it: a drafter that reads no settings must not drop
+        them silently.
+
+        Args:
+            algorithm_config: The parsed JSON object, uninterpreted.
+
+        Raises:
+            ValueError: This drafter takes no algorithm config.
+        """
+        raise ValueError(
+            f"{type(self).__name__} takes no --speculative-algorithm-config; "
+            f"got keys {sorted(algorithm_config)}"
+        )
 
     def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
         """Take the verifier's per-request sampling pools for sampled drafting.
@@ -355,13 +377,81 @@ class BaseDrafter:
         """Finish a round ``finish_round`` left pending (the next round's inputs)."""
 
     def capture_round_graphs(
-        self, graph_bs: int, *, stream: torch.cuda.Stream, pool: tuple[int, int]
+        self,
+        graph_bs: int,
+        *,
+        lo_bs: int,
+        stream: torch.cuda.Stream,
+        pool: tuple[int, int],
     ) -> None:
-        """Capture ``finish_round``'s graphs at a decode graph's padded batch."""
+        """Capture graphs serving ``lo_bs < live_bs <= graph_bs`` in this pool."""
+
+    def has_round_graphs(self, graph_bs: int) -> bool:
+        """Whether a completed prefill can use round graphs at this padded batch."""
+        return False
 
     def release_round_graphs(self) -> None:
         """Drop the graphs ``capture_round_graphs`` recorded (they name the cache pool)."""
 
+    def suspend_drafting(self, num_reqs: int, req_ids: Sequence[str]) -> bool:
+        """Whether to decode this batch without drafting.
+
+        Called on the host once per scheduled decode batch, before its inputs
+        are built, with the batch's request count and ids; it must not read
+        device memory. True suspends drafting for every request of the batch
+        for the rest of its life: they decode one token per round through
+        target-only graphs and never draft again. The default never suspends.
+        Capability: ``drafter.suspend_drafting``.
+        """
+        del num_reqs, req_ids
+        return False
+
+    def verify_widths(self, graph_bs: int) -> tuple[int, ...]:
+        """The verify widths to capture target decode graphs for at padded
+        batch ``graph_bs``, each in ``[2, spec_num_tokens]``.
+
+        Called once per captured batch size. A round verifying width ``w``
+        verifies the root and the first ``w - 1`` drafted tokens of each
+        request's window. The default is the configured width only.
+        Capability: ``drafter.verify_widths``.
+        """
+        del graph_bs
+        return (self.spec_num_tokens,)
+
+    def round_verify_width(self, bs: int) -> int:
+        """The verify width of the next decode round for ``bs`` live requests:
+        one of ``verify_widths`` of its padded batch.
+
+        Called on the host before each decode replay, only when
+        ``verify_widths`` is overridden; it must not read device memory. The
+        default is the configured width. Capability: ``drafter.verify_widths``.
+        """
+        del bs
+        return self.spec_num_tokens
+
     @abstractmethod
     def draft(self, *args, **kwargs) -> torch.Tensor | None:
         raise NotImplementedError
+
+
+# Hooks whose mechanism this runtime does not implement yet: a drafter that
+# overrides one is refused at startup instead of being silently ignored.
+_RESERVED_HOOKS = {
+    "suspend_drafting": "drafter.suspend_drafting",
+    "verify_widths": "drafter.verify_widths",
+    "round_verify_width": "drafter.verify_widths",
+}
+
+
+def reserved_hook_problems(drafter_cls: type) -> list[str]:
+    """The reserved ``BaseDrafter`` hooks ``drafter_cls`` overrides although
+    this runtime does not advertise their capability."""
+    from tokenspeed.runtime.plugins import PLUGIN_CAPABILITIES
+
+    return [
+        f"{drafter_cls.__name__}.{name} needs plugin capability {capability!r}, "
+        "which this runtime does not implement"
+        for name, capability in _RESERVED_HOOKS.items()
+        if capability not in PLUGIN_CAPABILITIES
+        and getattr(drafter_cls, name) is not getattr(BaseDrafter, name)
+    ]

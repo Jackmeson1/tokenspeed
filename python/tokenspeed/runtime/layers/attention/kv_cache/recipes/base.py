@@ -414,6 +414,7 @@ class CacheRecipe(ABC):
             max_scheduled_tokens=int(self.server_args.chunked_prefill_size),
             max_context_len=self.attn_config.context_len,
             decode_input_tokens=self.decode_input_tokens,
+            spec_draft_headroom=self.server_args.speculative_draft_headroom_tokens,
             overlap_schedule_depth=self.overlap_schedule_depth,
             disable_prefix_cache=not self.server_args.enable_prefix_caching,
         )

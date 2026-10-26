@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from torch import nn
@@ -47,3 +47,12 @@ class TargetCaptureConfigurator(ABC):
             target_model: The loaded target model on this rank.
             target_config: The resolved target text configuration.
         """
+
+
+@runtime_checkable
+class AuxHiddenStateCaptureTarget(Protocol):
+    """A target that can select the auxiliary hidden layers a draft consumes."""
+
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        """Select capture layers, or use the target defaults when IDs are omitted."""
+        ...

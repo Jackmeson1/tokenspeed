@@ -160,6 +160,32 @@ def test_rejects_unsized_pool_only_in_the_scheduler() -> None:
         ts.CapacityModel(cfg)
 
 
+@pytest.mark.parametrize("overlap_schedule_depth", [0, 1])
+@pytest.mark.parametrize("headroom", [0, 8, 44, 64])
+def test_lane_scratch_is_counted_once_in_capacity(
+    overlap_schedule_depth: int, headroom: int
+) -> None:
+    cfg = _sizing_config(
+        role=ts.SchedulerConfig.Role.Fused,
+        prefix_granularity=1,
+        max_scheduled_tokens=128,
+        max_batch_size=2,
+        decode_input_tokens=16,
+        overlap_schedule_depth=overlap_schedule_depth,
+        groups=[_full("full", 1, 1), _state("state", 1)],
+    )
+    cfg.spec_draft_headroom = headroom
+    model = ts.CapacityModel(cfg)
+    assert model.single_request_group_pages(token_limit=100) == [
+        100 + overlap_schedule_depth * 16 + headroom,
+        2,
+    ]
+    assert model.concurrent_group_pages(max_total_tokens=200, max_context_len=100) == [
+        200 + 2 * (overlap_schedule_depth * 16 + max(16, headroom)),
+        4,
+    ]
+
+
 @pytest.mark.parametrize("decode_input_tokens", [1, 3])
 @pytest.mark.parametrize("overlap_schedule_depth", [0, 1])
 @pytest.mark.parametrize("max_scheduled_tokens", [4, 9])

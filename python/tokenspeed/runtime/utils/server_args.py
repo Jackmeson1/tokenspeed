@@ -98,6 +98,22 @@ SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 _SPEC_OVERSHOOT_SPANS = 3
 
 
+def parse_speculative_algorithm_config(text: str) -> dict:
+    """Parse ``--speculative-algorithm-config``: a JSON object, else ValueError."""
+    try:
+        config = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"--speculative-algorithm-config must be valid JSON: {exc}"
+        ) from exc
+    if not isinstance(config, dict):
+        raise ValueError(
+            "--speculative-algorithm-config must be a JSON object, got "
+            f"{type(config).__name__}"
+        )
+    return config
+
+
 def spec_rope_positions(context: int, verify_width: int) -> int:
     """How many positions a RoPE table needs for a context.
 
@@ -599,6 +615,9 @@ class ServerArgs:
     draft_model_path_use_base: bool | None = False
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
+    # A JSON object of settings for a plugin-registered speculative algorithm,
+    # handed uninterpreted to its drafter (BaseDrafter.configure_algorithm).
+    speculative_algorithm_config: str | None = None
     speculative_draft_model_path: str | None = None
     speculative_draft_model_quantization: str | None = "unquant"
     speculative_num_steps: int = 3
@@ -740,14 +759,18 @@ class ServerArgs:
     def spec_context_pad(self) -> int:
         """Tokens the physical KV extent must hold past the logical context_len.
 
-        Zero without speculative decoding; see _SPEC_OVERSHOOT_SPANS for the
-        derivation. Sizing consumers (page tables, graph capture widths) add
+        Zero without speculative decoding; the verify overshoot spans (see
+        _SPEC_OVERSHOOT_SPANS for the derivation) plus a tree's draft-lane
+        headroom. Sizing consumers (page tables, graph capture widths) add
         this pad; user-semantic consumers (input validation, max_new_tokens
         folding, stop checks) keep the logical context_len.
         """
         if self.speculative_algorithm is None:
             return 0
-        return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
+        return (
+            _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
+            + self.speculative_draft_headroom_tokens
+        )
 
     def __post_init__(self):
         self.resolve_basic_defaults()
@@ -882,6 +905,24 @@ class ServerArgs:
             method = config.get("method")
             if method is not None and self.speculative_algorithm is None:
                 self.speculative_algorithm = str(method).upper()
+
+            if "method_config" in config:
+                method_config = config["method_config"]
+                if not isinstance(method_config, dict):
+                    raise ValueError(
+                        "method_config in --speculative-config must be a JSON object"
+                    )
+                if self.speculative_algorithm_config is not None and (
+                    parse_speculative_algorithm_config(
+                        self.speculative_algorithm_config
+                    )
+                    != method_config
+                ):
+                    raise ValueError(
+                        "--speculative-algorithm-config conflicts with "
+                        "method_config in --speculative-config"
+                    )
+                self.speculative_algorithm_config = json.dumps(method_config)
 
             draft_model = config.get("model")
             if draft_model is not None and self.speculative_draft_model_path is None:
@@ -1476,6 +1517,10 @@ class ServerArgs:
         self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
+        if self.speculative_algorithm_config is not None:
+            self._validate_speculative_algorithm_config(
+                self.speculative_algorithm_config
+            )
         if self.speculative_algorithm == "DUMMY":
             if (
                 self.speculative_draft_model_path is not None
@@ -1589,36 +1634,69 @@ class ServerArgs:
 
     @property
     def speculative_draft_tree(self) -> bool:
-        """Whether drafts go through the draft-tree path: ``topk > 1``."""
+        """Whether verify windows carry explicit parents: a draft tree
+        (``--speculative-eagle-topk`` other than 1) or a plugin
+        algorithm registered with ``uses_tree_layout=True``, chains included.
+        Plugins must be loaded for the latter; ``ModelConfig`` validates again
+        after discovery."""
+        from tokenspeed.runtime.execution.drafter import drafter_uses_tree_layout
+
         return self.speculative_algorithm is not None and (
             self.speculative_eagle_topk != 1
+            or drafter_uses_tree_layout(self.speculative_algorithm)
         )
 
+    @property
+    def speculative_draft_headroom_tokens(self) -> int:
+        """Extra cache slots past the verify window for a tree's draft lanes.
+
+        The accepted frontier can reach the end of the verify window. Each
+        later draft step writes topk lanes from that frontier. A plugin
+        chain with an explicit tree layout reserves one lane per step;
+        ordinary chains need no additional reservation.
+        """
+        if not self.speculative_draft_tree:
+            return 0
+        return (self.speculative_num_steps - 1) * self.speculative_eagle_topk
+
     def _validate_tree_speculation(self) -> None:
-        """Draft trees: EAGLE3/MTP with a node budget the draft can fill and a mask word can hold."""
+        """Draft trees with a node budget the draft can fill and a mask can hold.
+
+        Plugin drafters answer tree support at startup. The scheduler reserves
+        their configured lane writes past the verify window.
+        """
+        from tokenspeed.runtime.execution.drafter import IN_TREE_ALGORITHMS
+
         topk = self.speculative_eagle_topk
         steps = self.speculative_num_steps
         nodes = self.speculative_num_draft_tokens
-        if self.speculative_algorithm not in STEP_SPEC_ALGORITHMS:
+        algorithm = self.speculative_algorithm
+        if algorithm in IN_TREE_ALGORITHMS and algorithm not in STEP_SPEC_ALGORITHMS:
             raise ValueError(
                 f"speculative_eagle_topk={topk} (tree drafting) needs "
-                f"--speculative-algorithm EAGLE3 or MTP, got {self.speculative_algorithm}"
+                "--speculative-algorithm EAGLE3, MTP or a plugin algorithm "
+                f"whose drafter drafts trees, got {algorithm}"
             )
-        if not 1 <= topk <= 16 or not 1 <= steps <= 10:
+        max_steps = 10 if algorithm in STEP_SPEC_ALGORITHMS else 64
+        if not 1 <= topk <= 16 or not 1 <= steps <= max_steps:
             raise ValueError(
-                f"tree drafting needs 1..16 children per node and 1..10 steps: {topk=}, {steps=}"
+                f"tree drafting needs 1..16 children per node and 1..{max_steps} steps: {topk=}, {steps=}"
             )
-        if (steps - 1) * topk > nodes:
+        if self.speculative_draft_headroom_tokens > 64:
             raise ValueError(
                 f"tree drafting writes (steps - 1) * topk = {(steps - 1) * topk} lane slots per "
-                f"request into its {nodes}-slot draft window "
-                "(--speculative-num-draft-tokens); lower topk or steps"
+                "request, but its lane mask holds at most 64 slots; lower topk or steps"
             )
         candidates = topk + (steps - 1) * topk * topk
         if not 2 <= nodes <= min(64, candidates + 1):
             raise ValueError(
                 f"speculative_num_draft_tokens={nodes} must be in [2, {min(64, candidates + 1)}] "
                 f"for topk={topk} over {steps} steps (root + drafted nodes, at most 64)"
+            )
+        if topk > nodes:
+            raise ValueError(
+                f"tree drafting topk={topk} exceeds verify width {nodes}; "
+                "draft write-location buffers are sized by the verify width"
             )
         if self.grammar_backend != "none" or self.enable_mixed_batch:
             raise ValueError(
@@ -1636,6 +1714,27 @@ class ServerArgs:
                 "tree drafting does not support attention data parallelism yet: "
                 f"attention DP size {self.mapping.attn.dp_size}"
             )
+
+    def _validate_speculative_algorithm_config(self, config: str) -> None:
+        """Refuse a ``--speculative-algorithm-config`` nothing would read.
+
+        The settings belong to a plugin-registered algorithm's drafter; the
+        in-tree algorithms take theirs as server arguments, so a config for one
+        of them (or with speculation off) would be silently ignored. Plugins
+        load after server-args resolution, so the name check here is "not
+        in-tree"; ModelConfig validates the name against the registry.
+        """
+        from tokenspeed.runtime.execution.drafter import IN_TREE_ALGORITHMS
+
+        algorithm = self.speculative_algorithm
+        if algorithm is None or algorithm in IN_TREE_ALGORITHMS:
+            raise ValueError(
+                "--speculative-algorithm-config configures a plugin-registered "
+                f"speculative algorithm; --speculative-algorithm is {algorithm!r} "
+                f"(in-tree algorithms {sorted(IN_TREE_ALGORITHMS)} take server "
+                "arguments instead)"
+            )
+        parse_speculative_algorithm_config(config)
 
     def _validate_speculative_sampling(self):
         """Refuse ``--enable-speculative-sampling`` launches it cannot serve.
@@ -3310,6 +3409,15 @@ class ServerArgs:
             "discovery).",
         )
         parser.add_argument(
+            "--speculative-algorithm-config",
+            type=str,
+            default=ServerArgs.speculative_algorithm_config,
+            help="JSON object of settings for a plugin-registered "
+            "--speculative-algorithm, passed to its drafter uninterpreted. "
+            "Refused for in-tree algorithms. Also accepted as method_config in "
+            "--speculative-config.",
+        )
+        parser.add_argument(
             "--speculative-draft-model-path",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
@@ -3330,7 +3438,8 @@ class ServerArgs:
             "--speculative-eagle-topk",
             type=int,
             help="Children each draft node expands to per step; above 1 the draft is a tree "
-            "(EAGLE3, or EAGLE-style MTP), and --speculative-num-draft-tokens is its node budget.",
+            "(EAGLE3, EAGLE-style MTP, or a plugin algorithm whose drafter drafts trees), "
+            "and --speculative-num-draft-tokens is its node budget.",
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(

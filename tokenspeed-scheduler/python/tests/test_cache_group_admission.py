@@ -94,12 +94,14 @@ def test_overlap_decode_admission_uses_runtime_verify_width(verify_width: int):
 @pytest.mark.parametrize("overlap_depth", [0, 1])
 @pytest.mark.parametrize("accepted_tokens", [1, 3, 4])
 @pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("draft_headroom", [0, 44])
 def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions(
-    overlap_depth: int, accepted_tokens: int, mixed: bool
+    overlap_depth: int, accepted_tokens: int, mixed: bool, draft_headroom: int
 ):
     cfg = _base_config(num_device_pages=4096)
     cfg.prefix_granularity = 64
     cfg.decode_input_tokens = 4
+    cfg.spec_draft_headroom = draft_headroom
     cfg.overlap_schedule_depth = overlap_depth
     cfg.enable_mixed_prefill_decode = mixed
     cfg.disable_prefix_cache = True
@@ -139,7 +141,9 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
                 table = op.block_tables["compressor"][row]
                 committed = scheduler.request_token_size("long") - 1
                 reservation_end = (
-                    committed + (overlap_depth + 2) * cfg.decode_input_tokens
+                    committed
+                    + (overlap_depth + 1) * cfg.decode_input_tokens
+                    + max(cfg.decode_input_tokens, draft_headroom)
                 )
                 assert len(table) <= (reservation_end + 3) // 4
                 assert table[committed // 4] > 0
@@ -224,6 +228,85 @@ def test_an_overlapped_decode_reserves_the_next_verify_window_too():
         assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
     # The in-flight verify window, this decode's and the next one.
     assert _used_pages(scheduler) == 2 + 3 * 4
+
+
+@pytest.mark.parametrize("overlap_depth", [0, 1])
+@pytest.mark.parametrize("max_new_tokens", [0, 3, 128])
+def test_draft_lanes_reserve_scratch_without_widening_verify(
+    overlap_depth: int, max_new_tokens: int
+):
+    cfg = _speculative_config(16, overlap_depth, 256)
+    cfg.spec_draft_headroom = 44
+    scheduler = Scheduler(cfg)
+    request = _make_spec("r", [1, 2])
+    request.max_new_tokens = max_new_tokens
+    scheduler.submit_requests([request])
+    prefill = scheduler.next_execution_plan().forward[0]
+    # The first tree is drafted during prefill, before any output feedback.
+    assert len(prefill.block_tables["swa"][0]) >= 2 + 44
+    _advance_tokens(scheduler, "r", [3])
+    for pending in range(overlap_depth + 1):
+        decode = scheduler.next_execution_plan().forward[0]
+        assert decode.input_lengths == [16]
+        assert _used_pages(scheduler) == 2 + (pending + 1) * 16 + 44
+    # Accepted-token feedback must not replace or accumulate the fixed scratch.
+    _advance_tokens(scheduler, "r", [4])
+    _send_reserve(scheduler, "r", 1)
+    decode = scheduler.next_execution_plan().forward[0]
+    assert decode.input_lengths == [16]
+    assert _used_pages(scheduler) == 3 + (overlap_depth + 1) * 16 + 44
+
+
+@pytest.mark.parametrize("verify_width,headroom", [(16, -1), (16, 65), (1, 1), (0, 1)])
+def test_draft_lane_reservation_rejects_invalid_mask_width(
+    verify_width: int, headroom: int
+):
+    cfg = _speculative_config(verify_width, 0, 256)
+    cfg.spec_draft_headroom = headroom
+    with pytest.raises(ValueError, match="spec_draft_headroom"):
+        Scheduler(cfg)
+
+
+def test_draft_lane_scratch_is_in_the_single_request_capacity_bound():
+    cfg = _speculative_config(16, 0, 63)
+    cfg.spec_draft_headroom = 44
+    scheduler = Scheduler(cfg)
+    request = _make_spec("fits", [1, 2])
+    request.max_new_tokens = 16
+    scheduler.submit_requests([request])
+    scheduler.next_execution_plan()
+    _advance_tokens(scheduler, "fits", [3])
+    decode = scheduler.next_execution_plan().forward[0]
+    assert decode.input_lengths == [16]
+    assert scheduler.cache_group_available_pages("swa") == 0
+
+    too_large = _make_spec("too-large", [1, 2, 3])
+    too_large.max_new_tokens = 16
+    with pytest.raises(ValueError, match="exceeds cache capacity"):
+        Scheduler(cfg).submit_requests([too_large])
+
+
+@pytest.mark.parametrize("chunk_size", [1, 16])
+def test_generation_prepayment_includes_lane_scratch(chunk_size: int):
+    cfg = _speculative_config(16, 0, 256)
+    cfg.spec_draft_headroom = 44
+    cfg.max_scheduled_tokens = chunk_size
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="full",
+            block_granularity=1,
+            total_pages=256,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    scheduler = Scheduler(cfg)
+    request = _make_spec("r", [1, 2])
+    request.max_new_tokens = 128
+    scheduler.submit_requests([request])
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    # A fully prepaid request is exempt from ordinary retraction. Its scratch
+    # must still fit when it reaches the end of that prepaid generation.
+    assert 255 - scheduler.cache_group_available_pages("full") == 2 + 128 + 44
 
 
 @pytest.mark.parametrize("max_new_tokens", [0, 3])

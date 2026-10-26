@@ -38,7 +38,8 @@ spec_context_pad = ServerArgs.spec_context_pad.fget
 
 
 def _args(spec_algo, spec_num_tokens=None):
-    return SimpleNamespace(
+    return ServerArgs(
+        model="x",
         speculative_algorithm=spec_algo,
         speculative_num_draft_tokens=spec_num_tokens,
     )
@@ -51,6 +52,25 @@ class TestSpecContextPad:
     @pytest.mark.parametrize("algo", ["DFLASH", "DSPARK", "EAGLE3", "MTP"])
     def test_three_spans_for_every_spec_algo(self, algo):
         assert spec_context_pad(_args(algo, 4)) == _SPEC_OVERSHOOT_SPANS * 4
+
+    @pytest.mark.parametrize(
+        "algorithm,steps,headroom",
+        [("EAGLE3", 6, 20), ("MTP", 6, 20), ("EAGLE3", 10, 36)],
+    )
+    def test_tree_scratch_extends_physical_context_only(
+        self, algorithm, steps, headroom
+    ):
+        args = ServerArgs(
+            model="x",
+            max_model_len=4096,
+            speculative_algorithm=algorithm,
+            speculative_eagle_topk=4,
+            speculative_num_steps=steps,
+            speculative_num_draft_tokens=16,
+        )
+        assert args.spec_context_pad == _SPEC_OVERSHOOT_SPANS * 16 + headroom
+        assert args.max_model_len == 4096
+        assert args.speculative_num_draft_tokens == 16
 
     def test_spans_cover_the_overshoot_bound(self):
         # The overlap loop lets a finished request run ONE extra step. The

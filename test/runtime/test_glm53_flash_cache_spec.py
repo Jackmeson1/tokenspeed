@@ -107,6 +107,7 @@ def _recipe(
             chunked_prefill_size=8192,
             disaggregation_mode="null",
             enable_prefix_caching=True,
+            speculative_draft_headroom_tokens=0,
             speculative_algorithm="MTP" if draft_layers else None,
             speculative_num_draft_tokens=3,
         ),

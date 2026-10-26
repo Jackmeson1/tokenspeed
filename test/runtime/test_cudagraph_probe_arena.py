@@ -182,6 +182,7 @@ def test_offload_probe_budget_includes_hot_storage(monkeypatch) -> None:
             disaggregation_mode="null",
             chunked_prefill_size=1024,
             enable_prefix_caching=False,
+            speculative_draft_headroom_tokens=0,
         ),
         model_config=SimpleNamespace(
             num_attention_layers=2, hf_config=SimpleNamespace()

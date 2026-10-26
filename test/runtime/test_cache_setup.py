@@ -421,6 +421,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         speculative_num_draft_tokens=0,
         speculative_eagle_topk=1,
         speculative_draft_tree=False,
+        speculative_draft_headroom_tokens=0,
     )
 
     setup = prepare_cache_setup(
@@ -521,6 +522,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         speculative_num_draft_tokens=draft_tokens,
         speculative_eagle_topk=topk,
         speculative_draft_tree=topk > 1,
+        speculative_draft_headroom_tokens=0,
         enable_replay_ssm=replay_enabled,
     )
 
@@ -590,6 +592,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         speculative_num_draft_tokens=width,
         speculative_eagle_topk=1,
         speculative_draft_tree=False,
+        speculative_draft_headroom_tokens=0,
         enable_replay_ssm=False,
         disaggregation_mode=role,
     )
@@ -942,6 +945,50 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         )
 
 
+def test_draft_profile_naming_its_ordinary_family_binds_like_an_in_tree_draft() -> None:
+    from tokenspeed.runtime.configs.model_config import configure_mha_attention
+    from tokenspeed.runtime.configs.model_profile import ModelProfile
+    from tokenspeed.runtime.layers.attention.registry import (
+        _draft_profile_declares_cache_family,
+        _resolve_heterogeneous_draft_family,
+    )
+
+    def profile(cache_family: str) -> ModelProfile:
+        return ModelProfile(
+            configure_attention=configure_mha_attention,
+            cache_family=cache_family,
+            linear_attention=None,
+            default_attention_backend=None,
+            default_prefix_granularity=None,
+            request_token_history=False,
+            is_multimodal=False,
+            tokenizer_kwargs={},
+            attention_instances_per_layer=1,
+            numerics_envelopes=frozenset({"auto"}),
+        )
+
+    mha_draft = _mha_config()
+
+    def resolve(draft_profile: ModelProfile | None) -> str | None:
+        draft_family = "mha" if draft_profile is None else draft_profile.cache_family
+        return _resolve_heterogeneous_draft_family(
+            "qwen_gdn",
+            draft_family,
+            draft_family_declared=_draft_profile_declares_cache_family(
+                draft_profile, mha_draft
+            ),
+        )
+
+    # A registered MHA draft (a plugin's) binds through a hybrid target's
+    # recipe exactly like the in-tree draft of the same config, which has no
+    # profile.
+    assert resolve(None) is None
+    assert resolve(profile("mha")) is None
+    # A profile naming a family its config does not have still declares one.
+    with pytest.raises(RuntimeError, match="declares cache family 'mla'"):
+        resolve(profile("mla"))
+
+
 def test_hybrid_draft_layers_share_plan_with_disjoint_views() -> None:
     setup = _hybrid_setup_with_narrow_draft()
 
@@ -1171,6 +1218,7 @@ def _qwen_gdn_setup(
             speculative_num_draft_tokens=3,
             speculative_eagle_topk=1,
             speculative_draft_tree=False,
+            speculative_draft_headroom_tokens=0,
             enable_replay_ssm=False,
         ),
         model_config=SimpleNamespace(

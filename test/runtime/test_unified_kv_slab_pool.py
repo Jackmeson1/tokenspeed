@@ -472,6 +472,7 @@ class TestStateCacheGroupPageCountTest:
                 max_scheduled_tokens=max_scheduled_tokens,
                 max_context_len=4096,
                 decode_input_tokens=decode_input_tokens,
+                spec_draft_headroom=0,
                 overlap_schedule_depth=overlap_schedule_depth,
                 disable_prefix_cache=False,
             ),

@@ -51,13 +51,36 @@ logger = get_colorful_logger(__name__)
 
 ENTRY_POINT_GROUP = "tokenspeed.plugins"
 DISABLE_ENV_VAR = "TOKENSPEED_DISABLE_PLUGINS"
-# Bumped whenever a class or protocol on the plugin contract changes.
+# Bumped only when a change breaks existing plugins (a removed or renamed
+# registry function, hook or protocol member, or a changed meaning).
 PLUGIN_API_VERSION = 3
+# The additive contracts this runtime honours, by name. A plugin requires the
+# capabilities it uses instead of a minimum version, so contracts that land in
+# any order (or not at all) are told apart:
+#   drafter.algorithm_config    BaseDrafter.configure_algorithm and
+#                               --speculative-algorithm-config
+#   drafter.aux_hidden_capture  register_drafter(captures_aux_hidden_states=)
+#   drafter.tree_layout         register_drafter(uses_tree_layout=), drafter_uses_tree_layout
+#   drafter.tree_policy         Eagle.tree_candidates, seed_tree, expand_tree, verify_window
+PLUGIN_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        "drafter.algorithm_config",
+        "drafter.aux_hidden_capture",
+        "drafter.tree_layout",
+        "drafter.tree_policy",
+        "drafter.round_protocol",
+        "drafter.tree_lanes",
+        "attention.windowed_tree_lanes",
+        "sampling.draft_tree_q",
+        "sampling.tree_sampler",
+    }
+)
 
 __all__ = [
     "DISABLE_ENV_VAR",
     "ENTRY_POINT_GROUP",
     "PLUGIN_API_VERSION",
+    "PLUGIN_CAPABILITIES",
     "PluginInfo",
     "ensure_loaded",
     "list_plugins",

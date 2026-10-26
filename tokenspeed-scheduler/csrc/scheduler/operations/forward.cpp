@@ -420,9 +420,9 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                            return other.get() != request && other->HoldsPages();
                                        });
         const PrefillReserve reserve{
-            .decode_input_tokens = decode_input_tokens,
+            .decode_input_tokens = decode_input_tokens + config_.spec_draft_headroom,
             .completes_prefill = tokens == unscheduled,
-            .prompt_headroom_tokens = headroom > 0 ? unscheduled - tokens + headroom : 0,
+            .prompt_headroom_tokens = headroom > 0 ? unscheduled - tokens + headroom + config_.spec_draft_headroom : 0,
             .swa_hit_tokens = others_hold_pages ? hit_tokens : 0,
             .swa_later_chunk_tokens = others_hold_pages ? later_chunk_tokens : 0,
             .swa_prompt_after_hit_tokens = unscheduled,
@@ -575,12 +575,13 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         std::vector<GroupDemand> demands =
             MakeGroupDemands(tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{tokens}},
                              StateStep{.kind = StateStep::Kind::kRotate, .checkpoint = checkpoint});
-        ReservePrefillDemands(demands, config_.cache_groups,
-                              PrefillReserve{
-                                  .decode_input_tokens = reserve_num_tokens_in_next_schedule_event,
-                                  .completes_prefill = tokens == unscheduled,
-                                  .prompt_headroom_tokens = 0,
-                              });
+        ReservePrefillDemands(
+            demands, config_.cache_groups,
+            PrefillReserve{
+                .decode_input_tokens = reserve_num_tokens_in_next_schedule_event + config_.spec_draft_headroom,
+                .completes_prefill = tokens == unscheduled,
+                .prompt_headroom_tokens = 0,
+            });
         return demands;
     };
     // As for a first chunk: without room for the in-forward checkpoint's
@@ -629,13 +630,16 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         // reserved speculative slots after a prefill interrupts decode instead
         // of charging another verify span on every restart.
         const std::int32_t verify_end = num_computed_tokens + pending_decode_tokens + decode_width;
-        // Draft writes land in the next verify window up to the token limit; admission covers none without a budget.
+        // The ordinary next window is budget-capped; lane scratch must exist
+        // even at that limit and before any accepted-token feedback arrives.
         const std::int64_t draft_end =
             request->HasDeclaredBudget()
                 ? std::min({std::int64_t{verify_end} + CapacityModel::DraftWindowTokens(config_), request->TokenLimit(),
                             std::int64_t{std::numeric_limits<std::int32_t>::max()}})
                 : verify_end;
-        const auto decode_end = static_cast<std::int32_t>(std::max<std::int64_t>(verify_end, draft_end));
+        const auto decode_end = static_cast<std::int32_t>(
+            std::min(std::max(std::int64_t{verify_end} + config_.spec_draft_headroom, draft_end),
+                     std::int64_t{std::numeric_limits<std::int32_t>::max()}));
         std::int32_t reserved_end = decode_end;
         for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
             if (coordinator_.GroupIsState(static_cast<std::size_t>(i))) {
@@ -1226,9 +1230,9 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
             : request->PrefillSize() - (resumes_prefilling->window.begin + resumes_prefilling->window.size);
     const std::int32_t headroom = request->AdmissionHeadroom(kRetractionSafeSteps);
     const PrefillReserve reserve{
-        .decode_input_tokens = std::max(config_.decode_input_tokens, resume_reserve),
+        .decode_input_tokens = std::max(config_.decode_input_tokens, resume_reserve) + config_.spec_draft_headroom,
         .completes_prefill = resumes_prefilling == nullptr,
-        .prompt_headroom_tokens = headroom > 0 ? unscheduled + headroom : 0,
+        .prompt_headroom_tokens = headroom > 0 ? unscheduled + headroom + config_.spec_draft_headroom : 0,
     };
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
     // The image rebuilds the State tables' two slots as they were; the first

@@ -59,6 +59,8 @@ def register_drafter(
     *,
     model_cls: type | None = None,
     defaults_to_base_checkpoint: bool = False,
+    captures_aux_hidden_states: bool = False,
+    uses_tree_layout: bool = False,
     override: bool = False,
 ) -> None:
     """Register a speculative-decoding drafter; see the drafter registry.
@@ -76,6 +78,8 @@ def register_drafter(
         drafter_cls,
         model_cls=model_cls,
         defaults_to_base_checkpoint=defaults_to_base_checkpoint,
+        captures_aux_hidden_states=captures_aux_hidden_states,
+        uses_tree_layout=uses_tree_layout,
         override=override,
     )
 

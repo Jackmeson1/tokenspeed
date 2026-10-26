@@ -625,6 +625,18 @@ class AttentionBackend(CachePoolBinding, ABC):
         for backend in self.child_backends():
             backend.bind_tree_draft(inputs)
 
+    def begin_tree_lanes(self, bs: int, live_bs: int) -> None:
+        """Snapshot the round's page mappings before its first lane step.
+
+        ``bs`` includes graph padding; only ``live_bs`` leading requests
+        are live. Padding reads and writes use the null page. Safe to record
+        in a graph, or to call before replaying detached depth graphs.
+        Call every round once enabled; this does not replace lifecycle fences.
+        Backends without lane mappings only forward to their children.
+        """
+        for backend in self.child_backends():
+            backend.begin_tree_lanes(bs, live_bs)
+
     def compact_verify_window(self, path: torch.Tensor) -> None:
         """After a draft-tree verify, move each request's accepted path to the
         front of its verify window in the cache this node owns; nodes that own
@@ -719,6 +731,10 @@ class AttentionBackend(CachePoolBinding, ABC):
         lead the mixed batch. ``accepted_path`` is the ``[bs, N]`` accepted
         draft-tree path (root first, ``-1`` past it), ``None`` for a chain.
         Stateless backends inherit this no-op.
+
+        With a deferred draft round it runs on a side stream beside the round's
+        tail (``ForwardStepRunner.complete_round``): it may read only its
+        arguments, the forward's block tables and persistent buffers.
         """
 
     @contextmanager

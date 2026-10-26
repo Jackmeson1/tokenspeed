@@ -77,6 +77,7 @@ if TYPE_CHECKING:
         KVOffloadAdapter,
     )
     from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
         TreeVerifyInputs,
     )
     from tokenspeed.runtime.layers.attention.dcp.cache import (
@@ -165,6 +166,7 @@ class CacheGroupRouter(AttentionBackend):
         # Draft-tree verify: compaction's K/V address table, rebuilt on every pool bind.
         self._tree_verify_armed = False
         self._tree_window_rows: dict[str, tuple[torch.Tensor, int]] = {}
+        self._tree_draft: TreeDraftInputs | None = None
         self._init_pool_binding()
         self._forget_bound_pool_state()
 
@@ -199,6 +201,10 @@ class CacheGroupRouter(AttentionBackend):
         self._offload_adapter = None
         self._stacks: GroupTableStacks | None = None
         self._decode_views: dict[tuple[int, int], RouterDecodeWriteLocations] = {}
+        self._lane_stacks: GroupTableStacks | None = None
+        self._lane_row_tables: torch.Tensor | None = None
+        self._lane_write_locations: dict[str, torch.Tensor] | None = None
+        self._lane_snapshot_ready = False
         # Published write locations: the decode slot (graph-recorded views,
         # refreshed in place) and the extend span (the stack's buffer, or fresh past it).
         self.decode_write_locations: RouterDecodeWriteLocations | None = None
@@ -388,6 +394,8 @@ class CacheGroupRouter(AttentionBackend):
         self._decode_views = {}
         for leaf in self.leaves.values():
             leaf.init_cuda_graph_state(max_bs)
+        if self._tree_draft is not None:
+            self._init_lane_tables()
 
     @property
     def stacks(self) -> GroupTableStacks:
@@ -485,6 +493,60 @@ class CacheGroupRouter(AttentionBackend):
             f"{', '.join(unsupported)} slide or pack several tokens per row"
         )
         return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        super().bind_tree_draft(inputs)
+        self._tree_draft = inputs
+        if self._stacks is not None:
+            self._init_lane_tables()
+
+    def _init_lane_tables(self) -> None:
+        """Allocate before capture; begin_tree_lanes activates the snapshot."""
+        stacks = self.stacks
+        self._lane_stacks = GroupTableStacks(
+            self._table_specs(),
+            max_bs=stacks.max_bs,
+            max_tokens_per_req=self.spec_num_tokens,
+            max_extend_tokens=0,
+            device=self.device,
+        )
+        groups, max_bs, pages = stacks.tables.shape
+        self._lane_row_tables = stacks.tables.new_zeros(
+            (groups, max_bs * self._tree_draft.topk, pages)
+        )
+        self._lane_write_locations = None
+        self._lane_snapshot_ready = False
+
+    def begin_tree_lanes(self, bs: int, live_bs: int) -> None:
+        """Copy live mappings into the round's own read/write tables and
+        clear padding, including rows an unpadded extend did not refresh.
+
+        Storage is allocated at bind/init, so this can run inside the round's
+        graph or before detached depth capture/replay. The round must finish
+        before the next begin; existing lifecycle fences remain required.
+        """
+        if self._lane_stacks is None:
+            raise RuntimeError("tree lanes must be bound and initialized before begin")
+        if not 0 <= live_bs <= bs <= self.stacks.max_bs:
+            raise ValueError(
+                f"need 0 <= live_bs <= bs <= {self.stacks.max_bs}, got {live_bs=} {bs=}"
+            )
+        tables = self.stacks.tables[:, :live_bs]
+        lane_tables = self._lane_stacks.tables
+        lane_tables[:, :live_bs].copy_(tables)
+        lane_tables[:, live_bs:bs].zero_()
+        groups, _, pages = tables.shape
+        k = self._tree_draft.topk
+        rows = self._lane_row_tables[:, : bs * k].view(groups, bs, k, pages)
+        rows[:, :live_bs].copy_(tables[:, :, None].expand(-1, -1, k, -1))
+        rows[:, live_bs:].zero_()
+        if not self._lane_snapshot_ready:
+            for gid, leaf in self.leaves.items():
+                i = self.stacks.index(gid)
+                # Stack-width rows stay dense even for a narrower cache group;
+                # its trailing columns already hold the null page.
+                leaf.bind_lane_page_table(lane_tables[i], self._lane_row_tables[i])
+            self._lane_snapshot_ready = True
 
     def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
         super().bind_tree_verify(inputs)
@@ -585,6 +647,8 @@ class CacheGroupRouter(AttentionBackend):
         """
         self._leaf_for(layer)
         gid = layer.group_id
+        if forward_mode.is_decode() and self._lane_step_active:
+            return self._lane_write_locations[gid]
         if forward_mode.is_decode():
             published = self.decode_write_locations
             if published is None:
@@ -637,6 +701,7 @@ class CacheGroupRouter(AttentionBackend):
             and self.is_draft
             and self._decode_request_offset != 0
             and self._extend_write_locations is not None
+            and not self._lane_step_active
         )
         if not mixed_draft_step_zero:
             return self.write_locations(layer, forward_mode)
@@ -936,19 +1001,35 @@ class CacheGroupRouter(AttentionBackend):
         Eagle chain's one advancing slot, MTP's re-anchored k-window, the
         DFLASH block); the math and the address-stable storage live here.
         Captured-graph friendly: the same fused launch the decode refresh
-        records, over the same location stack, so ``write_locations`` /
+        records, over persistent location storage, so ``write_locations`` /
         the leaf forwards read the step's slots at recorded addresses.
+        Snapshot-enabled lanes use their own stack, leaving step 0's window intact.
 
         Returns the full-history group's ``[bs * num_tokens]`` view (the
         block drafters hand it to their fused prep kernels).
         """
         bs = cache_start.shape[0]
         # Window positions run cache_start .. cache_start+n-1.
+        if self._lane_step_active:
+            lanes = self._lane_stacks
+            lanes.compute_window_locations(bs, cache_start, num_tokens)
+            self._lane_write_locations = {
+                gid: lanes.decode_locations(gid, bs, num_tokens) for gid in self.leaves
+            }
+            return lanes.decode_locs[self._draft_history_index(), : bs * num_tokens]
         self.stacks.compute_window_locations(bs, cache_start, num_tokens)
         self._decode_request_offset = 0
         self._publish_decode_locations(bs, num_tokens)
         i = self._draft_history_index()
         return self.stacks.decode_locs[i, : bs * num_tokens]
+
+    @property
+    def _lane_step_active(self) -> bool:
+        return (
+            self._lane_snapshot_ready
+            and self._tree_draft is not None
+            and self._tree_draft.active
+        )
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Eagle chain step: republish the leaves' seq_lens, in-graph.

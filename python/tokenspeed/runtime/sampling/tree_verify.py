@@ -23,10 +23,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 
 import torch
 
-__all__ = ["DraftTreeQ", "TreeVerifyBatch", "accepted_path_rows"]
+__all__ = [
+    "DraftTreeQ",
+    "TreeSampler",
+    "TreeSamplerFactory",
+    "TreeVerifyBatch",
+    "accepted_path_rows",
+]
 
 
 @dataclass(frozen=True)
@@ -83,6 +93,41 @@ class TreeVerifyBatch:
     parents: torch.Tensor
     depths: torch.Tensor
     draft_q: DraftTreeQ | None = None
+
+
+class TreeSampler(Protocol):
+    """A graph-safe verifier bound to one sampling backend before capture.
+
+    Reads logits ``[bs * N, V]``, candidates and ancestry ``[bs, N]``,
+    pool indices ``[bs]`` and backend-generated uniforms (one per node and
+    one per bonus). Writes every output: packed predictions ``[bs * N]``,
+    node-local accepted path ``[bs, N]`` padded with -1, and lengths ``[bs]``
+    including the bonus. Supports both absent and recorded ``tree.draft_q``.
+    All work uses the caller's stream, with no host synchronization. Scratch
+    belongs to the sampler; pool-indexed state remains owned by the engine.
+    """
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        candidates: torch.Tensor,
+        tree: TreeVerifyBatch,
+        req_pool_indices: torch.Tensor,
+        *,
+        coins: torch.Tensor,
+        final_coins: torch.Tensor,
+        path: torch.Tensor,
+        predict: torch.Tensor,
+        accept_length: torch.Tensor,
+    ) -> None: ...
+
+
+class TreeSamplerFactory(Protocol):
+    """Allocate a sampler with engine-owned scalar pools and padded capacity."""
+
+    def __call__(
+        self, pools: SpeculativeSamplingPools, max_bs: int, device: torch.device | str
+    ) -> TreeSampler: ...
 
 
 def accepted_path_rows(path: torch.Tensor) -> torch.Tensor:

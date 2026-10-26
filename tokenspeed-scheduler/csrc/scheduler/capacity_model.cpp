@@ -87,11 +87,12 @@ std::int64_t CapacityModel::protectedTokens() const {
 }
 
 std::int64_t CapacityModel::DraftWindowTokens(const SchedulerConfig& config) {
-    // P hands off before its drafter writes past the first window.
+    // Tree lanes share the ordinary next-window reservation; charge the
+    // larger extent once. P only needs the explicit lane scratch.
     if (config.role == Role::kP || config.decode_input_tokens <= 1) {
-        return 0;
+        return config.spec_draft_headroom;
     }
-    return config.decode_input_tokens;
+    return std::max(config.decode_input_tokens, config.spec_draft_headroom);
 }
 
 std::int64_t CapacityModel::tailHandoverBlocks(std::size_t group_index) const {
@@ -117,7 +118,8 @@ std::int64_t CapacityModel::tailHandoverBlocks(std::size_t group_index) const {
 std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t token_limit) const {
     _assert(token_limit >= 0, "single-request token limit must be non-negative");
     const std::int64_t decode_width = decodeWidth();
-    const std::int64_t protected_tokens = protectedTokens();
+    // Lane scratch remains necessary even at the logical generation limit.
+    const std::int64_t protected_tokens = protectedTokens() + config_.spec_draft_headroom;
     // The largest accepted prompt must still leave the first decode/MTP
     // reservation inside token_limit.
     const std::int64_t max_prompt_tokens =

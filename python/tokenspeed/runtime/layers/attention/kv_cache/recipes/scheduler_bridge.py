@@ -138,6 +138,7 @@ class SchedulerLimits:
     max_scheduled_tokens: int
     max_context_len: int
     decode_input_tokens: int
+    spec_draft_headroom: int
     overlap_schedule_depth: int
     disable_prefix_cache: bool
 
@@ -168,6 +169,7 @@ def capacity_model(
     config.max_scheduled_tokens = limits.max_scheduled_tokens
     config.max_batch_size = limits.max_live_requests
     config.decode_input_tokens = limits.decode_input_tokens
+    config.spec_draft_headroom = limits.spec_draft_headroom
     config.overlap_schedule_depth = limits.overlap_schedule_depth
     config.disable_prefix_cache = limits.disable_prefix_cache
     config.cache_groups = [

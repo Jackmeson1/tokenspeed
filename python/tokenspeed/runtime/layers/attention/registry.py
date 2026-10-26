@@ -137,6 +137,21 @@ def _ordinary_cache_family(config: AttnConfig | None) -> CacheModelFamily | None
     return None
 
 
+def _draft_profile_declares_cache_family(
+    draft_profile: ModelProfile | None, draft_attn_config: AttnConfig | None
+) -> bool:
+    """Whether a draft's profile states a cache layout its attention config does not.
+
+    A registered draft model must carry a profile, but a profile naming the
+    ordinary family of its own attention config (a plugin MHA draft, say) adds
+    nothing an in-tree draft of that config lacks, so it binds through the
+    target's recipe the same way. Any other profile family is a declaration.
+    """
+    return draft_profile is not None and (
+        draft_profile.cache_family != _ordinary_cache_family(draft_attn_config)
+    )
+
+
 def _resolve_heterogeneous_draft_family(
     target_family: CacheModelFamily,
     draft_family: CacheModelFamily | None,
@@ -1292,7 +1307,9 @@ def create_attn_components(
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
         draft_cache_family,
-        draft_family_declared=draft_profile is not None,
+        draft_family_declared=_draft_profile_declares_cache_family(
+            draft_profile, draft_attn_config
+        ),
     )
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
     if profiled_cache_bytes is None:

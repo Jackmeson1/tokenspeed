@@ -62,6 +62,10 @@ def _runner(
         spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False
     )
     wrapper.device = "cpu"
+    wrapper.disable = False
+    wrapper.dp_size = 1
+    wrapper.max_capture_bs = 4
+    wrapper.disable_padding = False
     full_backend = object.__new__(AttentionBackend)
     full_backend.device = "cpu"
 
@@ -123,6 +127,7 @@ def _runner(
     wrapper.drafter = (
         SimpleNamespace(
             attn_backend=draft_backend,
+            has_round_graphs=lambda graph_bs: False,
             replay_decode_graph=lambda graph, *, bs, graph_bs: graph.replay(),
         )
         if has_drafter
@@ -145,7 +150,7 @@ def _runner(
     wrapper._prepare_request_token_history_graph_inputs = lambda **kwargs: None
     wrapper._expert_load_rows = None
     wrapper._graph_debug = False
-    wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
+    wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None, active=False)
     result = (
         torch.arange(16, dtype=torch.int32),
         torch.tensor([3, 1, 99, 99], dtype=torch.int32),

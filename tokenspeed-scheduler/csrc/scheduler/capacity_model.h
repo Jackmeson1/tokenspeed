@@ -63,7 +63,8 @@ public:
     // Largest token_limit whose SingleRequestGroupPages fit usable_lcm_blocks.
     std::int32_t MaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
 
-    // Tokens of the next verify window a speculative decode reserves for its draft steps; 0 without one or on P.
+    // Scratch beyond a verify frontier: the larger of the next window and
+    // explicit lane headroom. P only holds the explicit lane headroom.
     static std::int64_t DraftWindowTokens(const SchedulerConfig& config);
 
 private:

@@ -99,7 +99,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
     """
 
     # verify() here adds penalties and logit processors with no tree path yet.
+    supports_tree_sampler = False
     supports_tree_verify = False
+    verifies_draft_tree_q = False
 
     _SUPPORTS_DP_VERIFY = False
 

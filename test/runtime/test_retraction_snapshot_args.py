@@ -300,6 +300,7 @@ def _model(specs, packing):
             max_scheduled_tokens=2048,
             max_context_len=4096,
             decode_input_tokens=1,
+            spec_draft_headroom=0,
             overlap_schedule_depth=0,
             disable_prefix_cache=False,
         ),
@@ -374,6 +375,7 @@ def _device_request(**overrides):
         disaggregation_mode="null",
         chunked_prefill_size=2048,
         enable_prefix_caching=True,
+        speculative_draft_headroom_tokens=0,
     )
     knobs.update(overrides)
     specs = (FULL, SLIDING)

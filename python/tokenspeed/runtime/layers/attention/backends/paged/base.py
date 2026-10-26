@@ -152,6 +152,9 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self.tree_verify: TreeVerifyInputs | None = None
         # Draft-tree lane inputs; set on the drafter's leaves only.
         self.tree_draft: TreeDraftInputs | None = None
+        # The router installs these only when a caller starts lane snapshots.
+        self.lane_page_table: torch.Tensor | None = None
+        self.lane_row_page_table: torch.Tensor | None = None
         # Draft-tree verify: committed keys per request, the cascade's prefix.
         self.tree_prefix_lens_buf: torch.Tensor | None = None
         # A cache dealt over owners: the prefill reads of its cached prefix,
@@ -170,6 +173,19 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
 
     def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
         self.tree_draft = inputs
+        self.lane_page_table = None
+        self.lane_row_page_table = None
+
+    def bind_lane_page_table(
+        self, page_table: torch.Tensor, row_page_table: torch.Tensor
+    ) -> None:
+        """Bind the router's address-stable round snapshot: one row per
+        request and one per lane. Both tables include null graph padding
+        and may have trailing null columns for wider groups in the stack.
+        Callers that never begin a snapshot keep the ordinary decode tables.
+        """
+        self.lane_page_table = page_table
+        self.lane_row_page_table = row_page_table
 
     @property
     def tree_lane_step_active(self) -> bool:
@@ -218,6 +234,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         # Graph buffers and views return with init_cuda_graph_state.
         self.page_table_buf = None
         self.seq_lens_buf = None
+        self.lane_page_table = None
+        self.lane_row_page_table = None
         self.tree_prefix_lens_buf = None
         self._decode_views_by_bs = {}
         # Its gathers read the previous pool's layers.
@@ -276,6 +294,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         with more persistent decode state extends this (``super()`` first).
         """
         entries = max_bs * self.block_decode_expansion
+        self.lane_page_table = None
+        self.lane_row_page_table = None
         # The router hands this leaf [bs, max_num_pages] tables (context_len
         # already carries the spec-verify overshoot); null page 0 is the
         # padding contract's dereferenceable dummy.

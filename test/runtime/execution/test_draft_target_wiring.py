@@ -775,11 +775,11 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
 
     assert processor.do_argmax is False
     full = SimpleNamespace(next_token_logits=torch.randn(2, 50, device="cuda"))
-    scores, tokens = Eagle._score_candidates(drafter, full)
+    scores, tokens = Eagle.tree_candidates(drafter, full)
     assert scores.shape == tokens.shape == (2, 2)
     shard = SimpleNamespace(next_token_logits=torch.zeros(2, 25))
     with pytest.raises(RuntimeError, match="ranks all 50 draft tokens"):
-        Eagle._score_candidates(drafter, shard)
+        Eagle.tree_candidates(drafter, shard)
 
 
 @pytest.mark.parametrize("drafter_class", [DFlash, DSpark])

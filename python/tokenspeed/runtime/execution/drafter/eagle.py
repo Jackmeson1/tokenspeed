@@ -217,7 +217,16 @@ class Eagle(BaseDrafter):
         self.draft_tree = DraftTree(
             max_bs, config.topk, config.num_steps, config.num_nodes, self.device
         )
-        self._bind_tree_lanes(config, max_bs)
+        self.bind_tree_lanes(tree_spec)
+
+    def bind_tree_lanes(self, tree_spec: TreeSpec) -> None:
+        """Bind lane buffers without selecting or constructing a draft tree."""
+        if self.draft_reads_token_history:
+            raise NotImplementedError(
+                "tree drafting does not support draft token history yet"
+            )
+        self.tree_spec = tree_spec
+        self._bind_tree_lanes(tree_spec.config, self.input_buffers.max_bs)
 
     def _bind_tree_lanes(self, config: TreeSpecConfig, max_bs: int) -> None:
         """Bind the top-K draft lanes, as every tree drafter does."""
@@ -589,34 +598,54 @@ class Eagle(BaseDrafter):
                     next_tokens[:, i + 1] = self._map_hot(draft_ids)
                     hidden = logits_output.hidden_states
                 else:
-                    draft_ids, hidden = self._expand_tree_lanes(bs, i, logits_output)
+                    draft_ids, hidden = self.expand_tree(bs, i, logits_output)
                 if i + 1 < self.spec_num_steps:
                     positions.add_(1)
                     draft_seq_lens.add_(1)
                     if self.tree_lanes is not None:
                         slot_starts.add_(lanes)
 
-    def _seed_tree_lanes(
+    # ------------------------------------------------------------------
+    # Tree policy. A tree drafter overrides these four to choose its own
+    # candidates, lanes and verify window; the lane loop, the lane masks'
+    # storage (``tree_lanes``), the draft forwards and the verify path stay
+    # the engine's. Each runs inside the decode graph on the forward stream:
+    # device work only, no host synchronisation, fixed shapes per ``bs``.
+    # ------------------------------------------------------------------
+
+    def seed_tree(
         self,
         bs: int,
         logits_output: LogitsProcessorOutput,
         frontier: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Step 0 of a draft tree: the best K candidates become the lanes.
-        Returns their ``[bs, K]`` tokens and ``[bs * K, hidden]`` rows."""
+        """Step 0 of a draft tree: choose each request's K lanes.
+
+        ``logits_output`` holds one row per request (the draft extend's last
+        row); ``frontier`` is ``[bs]`` committed draft keys per request, to pass
+        to ``tree_lanes.set_frontier``. Writes the lanes' ancestry bits into
+        ``tree_lanes.lane_mask``. Returns the lanes' ``[bs, K]`` tokens (draft
+        vocabulary) and their ``[bs * K, hidden]`` input rows for step 1. The
+        default keeps the best K candidates of ``tree_candidates``.
+        """
         topk = self.lanes_per_request
-        lane_tokens = self.draft_tree.seed(bs, *self._score_candidates(logits_output))
+        lane_tokens = self.draft_tree.seed(bs, *self.tree_candidates(logits_output))
         self.tree_lanes.lane_mask[: bs * topk].view(bs, topk).copy_(
             self._tree_seed_lane_mask
         )
         self.tree_lanes.set_frontier(bs, frontier)
         return lane_tokens, logits_output.hidden_states.repeat_interleave(topk, dim=0)
 
-    def _expand_tree_lanes(
+    def expand_tree(
         self, bs: int, step: int, logits_output: LogitsProcessorOutput
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Keep each request's best K children as the next lanes; returns
-        their tokens and hidden rows (``None`` after the last step)."""
+        """Draft step ``step`` (1 .. S - 1): choose the next K lanes from the
+        ``bs * K`` lane rows in ``logits_output``.
+
+        Updates ``tree_lanes.lane_mask`` for the next step. Returns the next
+        lanes' ``[bs, K]`` tokens and ``[bs * K, hidden]`` rows, ``None`` rows
+        after the last step. The default keeps each request's best K children.
+        """
         topk = self.lanes_per_request
         last = step == self.spec_num_steps - 1
         next_hidden = None if last else torch.empty_like(logits_output.hidden_states)
@@ -624,14 +653,20 @@ class Eagle(BaseDrafter):
         lane_tokens = self.draft_tree.expand(
             bs,
             step,
-            *self._score_candidates(logits_output),
+            *self.tree_candidates(logits_output),
             None if last else (lane_mask, logits_output.hidden_states, next_hidden),
         )
         return lane_tokens, next_hidden
 
-    def _draft_window(self, bs: int, next_tokens: torch.Tensor) -> torch.Tensor:
-        """The next verify window: the chain's tokens, or the best tree's
-        (whose parents become the next round's tree)."""
+    def verify_window(self, bs: int, next_tokens: torch.Tensor) -> torch.Tensor:
+        """The next round's verify window, ``[bs, N]`` tokens in node order.
+
+        Column 0 of ``next_tokens`` is each request's last verified token (the
+        root). For a tree, writes each node's parent to
+        ``tree_spec.draft_parent_buf[:bs]`` (``-1`` for the root, every parent
+        before its child) and returns target-vocabulary tokens. The default
+        returns a chain as is and the best N - 1 tree nodes for a tree.
+        """
         if self.tree_spec is None:
             return next_tokens
         tokens, parent = self.draft_tree.finalize(bs, next_tokens[:, 0])
@@ -639,12 +674,14 @@ class Eagle(BaseDrafter):
         self.tree_spec.draft_parent_buf[:bs].copy_(parent)
         return tokens
 
-    def _score_candidates(
+    def tree_candidates(
         self, logits_output: LogitsProcessorOutput
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Each draft row's best K candidates: ``[rows, K]`` log-probabilities
-        (best first) and tokens. The one place a drafter decides how the tree
-        scores candidates; DraftTree only records and selects."""
+        (best first) and draft-vocabulary tokens. The one place a drafter
+        decides how the tree scores candidates; ``seed_tree`` and
+        ``expand_tree`` record and select. The default ranks the draft LM
+        head's full logits."""
         logits = logits_output.next_token_logits
         if logits.shape[-1] != self.tree_vocab_size:
             raise RuntimeError(
@@ -717,10 +754,10 @@ class Eagle(BaseDrafter):
             next_tokens[:, 1] = self._map_hot(draft_ids)
             hidden = logits_output.hidden_states
         else:
-            draft_ids, hidden = self._seed_tree_lanes(bs, logits_output, frontier)
+            draft_ids, hidden = self.seed_tree(bs, logits_output, frontier)
 
         if self.spec_num_steps <= 1:
-            return self._draft_window(bs, next_tokens)
+            return self.verify_window(bs, next_tokens)
 
         if self.input_buffers.all_extends_mid_chunk and self.dp_size == 1:
             # Skip multi-step when the whole batch is mid-chunk EXTEND:
@@ -749,7 +786,7 @@ class Eagle(BaseDrafter):
                 dsa_topk,
                 frontier,
             )
-        return self._draft_window(bs, next_tokens)
+        return self.verify_window(bs, next_tokens)
 
     @override
     @nvtx_range("drafter", color="purple")

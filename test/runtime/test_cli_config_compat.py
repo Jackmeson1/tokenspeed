@@ -888,18 +888,30 @@ class TestCLIConfigCompat:
         for algorithm in ("EAGLE3", "MTP"):
             sa = self._resolve_tree(algorithm, 4, 5, 16)
             assert (sa.speculative_eagle_topk) == (4)
+            sa = self._resolve_tree(algorithm, 4, 6, 16)
+            assert sa.speculative_num_draft_tokens == 16
+            assert sa.speculative_draft_headroom_tokens == 20
+            assert sa.spec_context_pad == 3 * 16 + 20
+            self._resolve_tree(algorithm, 4, 5, 8)
         # Largest budgets: 16 children per node; 64 nodes and 64 lane slots.
         self._resolve_tree("EAGLE3", 16, 5, 64)
         self._resolve_tree("EAGLE3", 8, 9, 64)
+        sa = self._resolve_tree("EAGLE3", 4, 10, 16)
+        assert sa.speculative_num_draft_tokens == 16
+        assert sa.speculative_draft_headroom_tokens == 36
 
     def test_speculative_eagle_topk_rejects_unsupported_trees(self, subtests):
         cases = [
-            (("DFLASH", 4, 15, 16), {}, "needs --speculative-algorithm EAGLE3 or MTP"),
+            (
+                ("DFLASH", 4, 15, 16),
+                {},
+                "needs --speculative-algorithm EAGLE3, MTP or a plugin algorithm",
+            ),
             (("EAGLE3", 17, 2, 16), {}, "1..16 children"),
             (("EAGLE3", 0, 3, 4), {}, "1..16 children"),
             (("EAGLE3", 4, 11, 16), {}, "1..10 steps"),
             (("EAGLE3", 16, 6, 64), {}, "lane slots"),
-            (("EAGLE3", 4, 5, 8), {}, "lane slots"),
+            (("EAGLE3", 8, 10, 64), {}, "lane slots"),
             (("EAGLE3", 4, 5, 65), {}, "speculative_num_draft_tokens=65"),
             (("EAGLE3", 2, 2, 8), {}, "speculative_num_draft_tokens=8"),
             (("EAGLE3", 4, 5, 16), {"grammar_backend": "xgrammar"}, "structured"),

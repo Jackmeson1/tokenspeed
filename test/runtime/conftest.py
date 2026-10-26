@@ -111,6 +111,7 @@ def kimi_recipe(
             enable_prefix_caching=True,
             speculative_algorithm=speculative_algorithm,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_draft_headroom_tokens=0,
         ),
         model_config=SimpleNamespace(hf_text_config=text_config),
         attn_config=attn_config,

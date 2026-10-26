@@ -70,6 +70,9 @@ struct SchedulerConfig {
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
+    // Round-local draft lane slots after the accepted verify frontier.
+    // This is cache capacity, never a forward input width.
+    std::int32_t spec_draft_headroom{0};
     // Number of scheduler iterations that may be dispatched before the
     // accepted decode length is committed. The current event loop supports
     // only the non-overlapped (0) and one-step-overlapped (1) contracts.

@@ -1168,6 +1168,7 @@ def _retraction_pool_request(
                 max_scheduled_tokens=int(server_args.chunked_prefill_size),
                 max_context_len=max_context_len,
                 decode_input_tokens=decode_input_tokens,
+                spec_draft_headroom=server_args.speculative_draft_headroom_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
                 disable_prefix_cache=not server_args.enable_prefix_caching,
             ),

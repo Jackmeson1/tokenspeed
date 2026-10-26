@@ -143,6 +143,10 @@ class DeepEPCudaGraphRunnerAdapter:
     def __init__(self):
         self._active = False
 
+    @property
+    def active(self) -> bool:
+        return self._active
+
     @staticmethod
     def _get_buffer_cls():
         try:
@@ -679,7 +683,12 @@ class ForwardStepRunner:
             # The drafter's own graphs at this batch share the pool and the measure.
             if self.drafter is not None and variant == CUDA_GRAPH_VARIANT_DEFAULT:
                 self.drafter.capture_round_graphs(
-                    bs, stream=self.stream, pool=graph.pool()
+                    bs,
+                    lo_bs=max(
+                        (size for size in self.capture_bs if size < bs), default=0
+                    ),
+                    stream=self.stream,
+                    pool=graph.pool(),
                 )
 
         self.device_module.synchronize()
@@ -990,6 +999,27 @@ class ForwardStepRunner:
     def can_run(self, bs: int, ctx: ForwardContext) -> bool:
         return self._can_use_graph(bs, ctx)
 
+    def _round_graph_bs(self, bs: int, ctx: ForwardContext) -> int | None:
+        """Reuse a decode bucket's round graphs for a pure extend.
+
+        DeepEP restores captured dispatch mode only on decode replay; DP ranks
+        may have different extend batches. Both keep eager extend drafting.
+        """
+        if (
+            self.disable
+            or self.drafter is None
+            or self.deepep_adapter.active
+            or self.dp_size > 1
+            or bs == 0
+            or not ctx.forward_mode.is_extend()
+            or ctx.num_extends != bs
+            or bs > self.max_capture_bs
+            or (self.disable_padding and not self._has_cuda_graph_for_bs(bs))
+        ):
+            return None
+        graph_bs = self._padded_bs(bs, ctx)
+        return graph_bs if self.drafter.has_round_graphs(graph_bs) else None
+
     def padded_bs(self, bs: int, ctx: ForwardContext) -> int:
         return self._padded_bs(bs, ctx)
 
@@ -1241,5 +1271,5 @@ class ForwardStepRunner:
                 ),
             )
 
-        self.last_graph_bs = padded_bs if use_graph else None
+        self.last_graph_bs = padded_bs if use_graph else self._round_graph_bs(bs, ctx)
         return result

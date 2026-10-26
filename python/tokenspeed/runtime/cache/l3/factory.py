@@ -173,10 +173,12 @@ def l3_settings(
                         f"{field_id} is head-partitioned"
                     )
 
-    from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
+    from tokenspeed.runtime.execution.drafter import (
+        drafter_captures_aux_hidden_states,
+    )
 
     eagle3_layers_to_capture: tuple[int, ...] = ()
-    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
+    if drafter_captures_aux_hidden_states(server_args.speculative_algorithm):
         configured_layers = server_args.eagle3_layers_to_capture
         if configured_layers:
             eagle3_layers_to_capture = tuple(int(layer) for layer in configured_layers)

@@ -124,6 +124,12 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     if (decode_input_tokens < 0) {
         throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
     }
+    if (spec_draft_headroom < 0 || spec_draft_headroom > 64) {
+        throw std::invalid_argument("Scheduler: spec_draft_headroom must be in [0, 64] for the lane mask");
+    }
+    if (spec_draft_headroom > 0 && decode_input_tokens <= 1) {
+        throw std::invalid_argument("Scheduler: spec_draft_headroom requires a speculative decode_input_tokens > 1");
+    }
     if (max_scheduled_tokens <= 0) {
         throw std::invalid_argument("Scheduler: max_scheduled_tokens must be > 0");
     }

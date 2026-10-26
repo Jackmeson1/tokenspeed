@@ -24,7 +24,7 @@ import gc
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
@@ -56,6 +56,7 @@ from tokenspeed.runtime.execution.accept_simulation import (
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
+from tokenspeed.runtime.execution.drafter.base import reserved_hook_problems
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -130,7 +131,10 @@ from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import (
+    ServerArgs,
+    parse_speculative_algorithm_config,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -426,6 +430,9 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # Verify window width: spec_num_steps + 1 for a chain, the tree's node budget otherwise.
     spec_num_tokens: int | None = None
+    # --speculative-algorithm-config, parsed: a plugin algorithm's own
+    # settings, handed to its drafter (BaseDrafter.configure_algorithm).
+    spec_algorithm_config: dict[str, Any] | None = None
     # Recorded draft probabilities above this value mark a slot with no
     # proposal (always reject); only read under enable_speculative_sampling.
     spec_reject_draft_prob_threshold: float = 2.0
@@ -453,8 +460,11 @@ class ModelExecutorConfig:
 
     @property
     def spec_draft_tree(self) -> bool:
-        """Whether drafts go through the draft-tree path."""
-        return self.spec_topk > 1
+        """Whether verify windows carry explicit parents (a draft tree, or a
+        plugin chain registered with ``uses_tree_layout``)."""
+        from tokenspeed.runtime.execution.drafter import drafter_uses_tree_layout
+
+        return self.spec_topk > 1 or drafter_uses_tree_layout(self.spec_algo)
 
     @staticmethod
     def from_server_args(
@@ -531,6 +541,13 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            spec_algorithm_config=(
+                None
+                if server_args.speculative_algorithm_config is None
+                else parse_speculative_algorithm_config(
+                    server_args.speculative_algorithm_config
+                )
+            ),
             enable_speculative_sampling=server_args.enable_speculative_sampling,
             spec_reject_draft_prob_threshold=server_args.spec_reject_draft_prob_threshold,
             spec_topk=(
@@ -664,6 +681,9 @@ class ModelExecutor:
                 config.spec_algo,
                 None if draft_model_runner is None else draft_model_runner.model,
             )
+            reserved = reserved_hook_problems(DrafterImpl)
+            if reserved:
+                raise NotImplementedError("; ".join(reserved))
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
@@ -674,6 +694,8 @@ class ModelExecutor:
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,
             )
+            if config.spec_algorithm_config is not None:
+                self.drafter.configure_algorithm(config.spec_algorithm_config)
             self.drafter.wire_target(self.model_runner.model)
             # Draft-prob sampling reads the request's temperature / top-k /
             # seed from the verifier's pool buffers: one owner of per-request
@@ -797,7 +819,7 @@ class ModelExecutor:
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(
                 f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
-                "use --sampling-backend greedy, triton or flashinfer"
+                "use --sampling-backend greedy or triton, or a plugin tree sampler"
             )
         if self.draft_attn_backend is self.attn_backend:
             raise NotImplementedError(

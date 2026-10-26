@@ -44,7 +44,10 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+    from tokenspeed.runtime.sampling.tree_verify import (
+        TreeSamplerFactory,
+        TreeVerifyBatch,
+    )
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -632,8 +635,23 @@ class SamplingBackend(ABC):
         return None and let the caller fall back to two separate D2Hs."""
         return None
 
+    supports_tree_sampler: bool = False
+
+    def bind_tree_sampler(self, factory: TreeSamplerFactory) -> None:
+        """Bind a plugin verifier once, before capture, for this instance only.
+
+        Supported backends supply their scalar pools, padded batch capacity
+        and device to the factory, then advertise tree and recorded-q support.
+        Other backends reject binding without invoking the factory.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot bind a plugin tree sampler"
+        )
+
     # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
     supports_tree_verify: bool = False
+    # Tree-layout support alone does not imply rejection against recorded q.
+    verifies_draft_tree_q: bool = False
 
     @abstractmethod
     def sample(

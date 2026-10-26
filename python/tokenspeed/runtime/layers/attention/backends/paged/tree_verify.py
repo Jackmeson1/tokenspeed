@@ -86,6 +86,7 @@ class TreeDraftInputs:
         self.num_slots = (num_steps - 1) * topk
         # True while a lane forward (drafting steps 1 .. S - 1) runs.
         self.active = False
+        self.step = 0
         self.lane_mask = torch.zeros((max_bs * topk,), dtype=torch.int64, device=device)
         # Committed draft keys per request, and those plus the lane window.
         self.frontier = torch.zeros((max_bs,), dtype=torch.int32, device=device)
@@ -97,13 +98,27 @@ class TreeDraftInputs:
 
     def cascade_rows(self, leaf: PagedAttentionBackend, bs: int) -> TreeCascadeRows:
         """The cascade ``leaf`` runs for the first ``bs`` requests' lane rows."""
+        page_table = (
+            leaf.lane_page_table
+            if leaf.lane_page_table is not None
+            else leaf.page_table_buf
+        )
+        if page_table is None:
+            raise RuntimeError("tree lanes require initialized page tables")
+        row_table = leaf.lane_row_page_table
         return TreeCascadeRows(
-            page_table=leaf.page_table_buf[:bs],
+            page_table=page_table[:bs],
             seq_lens=self.window_seq_lens[:bs],
             prefix_lens=self.frontier[:bs],
             mask=self.lane_mask[: bs * self.topk],
             rows=self.topk,
             window=self.num_slots,
+            row_page_table=(None if row_table is None else row_table[: bs * self.topk]),
+            row_prefix_lens=(
+                None
+                if row_table is None
+                else self.frontier[:bs].repeat_interleave(self.topk)
+            ),
         )
 
 

@@ -746,12 +746,20 @@ class ModelConfig:
             # Post-discovery replacement for the CLI choices= this flag no
             # longer carries: plugins may have added algorithms.
             from tokenspeed.runtime.execution.drafter import (
+                IN_TREE_ALGORITHMS,
                 require_plugin_draft_checkpoint,
                 validate_drafter_algorithm,
             )
 
             validate_drafter_algorithm(server_args.speculative_algorithm)
             require_plugin_draft_checkpoint(server_args)
+            # In-tree algorithms were validated with the server args; a plugin
+            # algorithm's tree layout is known only after discovery.
+            if (
+                server_args.speculative_algorithm not in IN_TREE_ALGORITHMS
+                and server_args.speculative_draft_tree
+            ):
+                server_args._validate_tree_speculation()
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization

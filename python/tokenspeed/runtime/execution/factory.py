@@ -26,7 +26,10 @@ from typing import TYPE_CHECKING
 
 import tokenspeed.runtime.layers.attention.backends  # noqa: F401  # trigger register_backend() calls
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.execution.drafter import get_drafter_impl
+from tokenspeed.runtime.execution.drafter import (
+    drafter_captures_aux_hidden_states,
+    get_drafter_impl,
+)
 from tokenspeed.runtime.execution.model_executor import (
     ModelExecutor,
     ModelExecutorConfig,
@@ -36,7 +39,10 @@ from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
-from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
+from tokenspeed.runtime.models.target_capture import (
+    AuxHiddenStateCaptureTarget,
+    TargetCaptureConfigurator,
+)
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
 from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS, ServerArgs
@@ -213,9 +219,15 @@ def configure_draft_target(
         )
     if DrafterImpl.shares_target_embed_head:
         _share_target_embed_and_head(model_runner, draft_model)
-    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS and hasattr(
-        model_runner.model, "set_eagle3_layers_to_capture"
-    ):
+    if drafter_captures_aux_hidden_states(server_args.speculative_algorithm):
+        if not isinstance(model_runner.model, AuxHiddenStateCaptureTarget):
+            if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
+                return  # Preserve the native algorithm's existing capture behavior.
+            raise TypeError(
+                f"{server_args.speculative_algorithm} requires auxiliary hidden "
+                f"capture, but {type(model_runner.model).__name__} does not "
+                "implement AuxHiddenStateCaptureTarget"
+            )
         # capture the layers the draft was trained on, not the default
         aux_layer_ids = server_args.eagle3_layers_to_capture or _eagle_aux_layer_ids(
             draft_model_runner.model_config.hf_config

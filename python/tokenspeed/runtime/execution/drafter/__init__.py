@@ -40,6 +40,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 __all__ = [
+    "IN_TREE_ALGORITHMS",
+    "drafter_captures_aux_hidden_states",
+    "drafter_uses_tree_layout",
     "get_drafter_impl",
     "register_drafter",
     "registered_drafter_algorithms",
@@ -48,7 +51,7 @@ __all__ = [
 ]
 
 #: Algorithms the in-tree resolution below serves.
-_IN_TREE_ALGORITHMS = frozenset({"EAGLE3", "MTP", "DFLASH", "DSPARK", "DUMMY"})
+IN_TREE_ALGORITHMS = frozenset({"EAGLE3", "MTP", "DFLASH", "DSPARK", "DUMMY"})
 
 
 @dataclass
@@ -58,6 +61,8 @@ class _AlgorithmEntries:
     scoped: list[tuple[type, type]] = field(default_factory=list)
     default: type | None = None
     defaults_to_base_checkpoint: bool = False
+    captures_aux_hidden_states: bool = False
+    uses_tree_layout: bool = False
 
 
 _PLUGIN_DRAFTERS: dict[str, _AlgorithmEntries] = {}
@@ -69,6 +74,8 @@ def register_drafter(
     *,
     model_cls: type | None = None,
     defaults_to_base_checkpoint: bool = False,
+    captures_aux_hidden_states: bool = False,
+    uses_tree_layout: bool = False,
     override: bool = False,
 ) -> None:
     """Register a drafter class for a speculative algorithm.
@@ -86,16 +93,58 @@ def register_drafter(
             plugins load, so launches still pass ``--draft-model-path-use-base``;
             one that omits every draft path is refused with that instruction
             (``require_plugin_draft_checkpoint``).
+        captures_aux_hidden_states: Whether this algorithm's draft reads the
+            target's auxiliary hidden states, as EAGLE3 does: the target then
+            captures the layers ``--eagle3-layers-to-capture`` or the draft
+            config's ``eagle_aux_hidden_state_layer_ids`` name, and the draft
+            receives them in ``logits_output.hidden_states``. This is an
+            algorithm-wide contract declared by its default registration.
+            Model-scoped entries inherit it and cannot enable capture for an
+            algorithm whose default does not capture.
+        uses_tree_layout: Whether this algorithm's drafter drafts with
+            explicit parents and draft lanes even at ``--speculative-eagle-topk
+            1``: the engine then binds a tree (``BaseDrafter.bind_tree``) for
+            chains too. Algorithm-wide like ``captures_aux_hidden_states``;
+            read after plugin discovery, before cache sizing and model
+            construction.
         override: Allow replacing an existing default entry (in-tree or
             plugin). Overrides are logged by the plugin loader.
 
     Raises:
         ValueError: An unscoped registration collides without ``override``.
     """
+    from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
+
     existing = _PLUGIN_DRAFTERS.get(algorithm)
+    captures_aux = drafter_captures_aux_hidden_states(algorithm)
+    new_captures_aux = (
+        algorithm in AUX_CAPTURE_SPEC_ALGORITHMS or captures_aux_hidden_states
+    )
+    if model_cls is not None and captures_aux_hidden_states and not captures_aux:
+        raise ValueError(
+            "auxiliary capture must be declared on the algorithm default "
+            "before registering model-scoped drafters"
+        )
+    tree_layout = drafter_uses_tree_layout(algorithm)
+    if model_cls is not None and uses_tree_layout and not tree_layout:
+        raise ValueError(
+            "the tree layout must be declared on the algorithm default "
+            "before registering model-scoped drafters"
+        )
+    if model_cls is None and existing is not None and existing.scoped:
+        if new_captures_aux != captures_aux:
+            raise ValueError(
+                "cannot change auxiliary capture while model-scoped drafters "
+                "inherit the algorithm contract"
+            )
+        if uses_tree_layout != tree_layout:
+            raise ValueError(
+                "cannot change the tree layout while model-scoped drafters "
+                "inherit the algorithm contract"
+            )
     if model_cls is None:
         taken = (existing is not None and existing.default is not None) or (
-            algorithm in _IN_TREE_ALGORITHMS
+            algorithm in IN_TREE_ALGORITHMS
         )
         if taken and not override:
             raise ValueError(
@@ -113,12 +162,17 @@ def register_drafter(
     # back exactly the state it saw.
     prior_default = entries.default
     prior_defaults_to_base = entries.defaults_to_base_checkpoint
+    prior_captures_aux = entries.captures_aux_hidden_states
+    prior_tree_layout = entries.uses_tree_layout
     if model_cls is not None:
         entries.scoped.insert(0, (model_cls, drafter_cls))
     else:
         entries.default = drafter_cls
     if defaults_to_base_checkpoint:
         entries.defaults_to_base_checkpoint = True
+    if model_cls is None:
+        entries.captures_aux_hidden_states = new_captures_aux
+        entries.uses_tree_layout = uses_tree_layout
 
     def undo() -> None:
         if model_cls is not None:
@@ -129,6 +183,8 @@ def register_drafter(
         else:
             entries.default = prior_default
         entries.defaults_to_base_checkpoint = prior_defaults_to_base
+        entries.captures_aux_hidden_states = prior_captures_aux
+        entries.uses_tree_layout = prior_tree_layout
         if created and entries.default is None and not entries.scoped:
             _PLUGIN_DRAFTERS.pop(algorithm, None)
 
@@ -143,7 +199,36 @@ def register_drafter(
 
 def registered_drafter_algorithms() -> frozenset[str]:
     """Every speculative algorithm name, in-tree and plugin-registered."""
-    return _IN_TREE_ALGORITHMS | frozenset(_PLUGIN_DRAFTERS)
+    return IN_TREE_ALGORITHMS | frozenset(_PLUGIN_DRAFTERS)
+
+
+def drafter_captures_aux_hidden_states(algorithm: str | None) -> bool:
+    """Whether ``algorithm``'s draft reads the target's auxiliary hidden states.
+
+    True for EAGLE3 and for a plugin algorithm registered with
+    ``captures_aux_hidden_states=True``. Plugins must be loaded first.
+    """
+    # server_args imports this package, so the constant is imported lazily.
+    from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
+
+    if algorithm is None:
+        return False
+    if algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
+        return True
+    entries = _PLUGIN_DRAFTERS.get(algorithm)
+    return entries is not None and entries.captures_aux_hidden_states
+
+
+def drafter_uses_tree_layout(algorithm: str | None) -> bool:
+    """Whether ``algorithm``'s drafter needs explicit ancestry even for chains.
+
+    True for a plugin algorithm registered with ``uses_tree_layout=True``.
+    Plugins must be loaded first.
+    """
+    if algorithm is None:
+        return False
+    entries = _PLUGIN_DRAFTERS.get(algorithm)
+    return entries is not None and entries.uses_tree_layout
 
 
 def validate_drafter_algorithm(name: str | None) -> None:
@@ -181,7 +266,7 @@ def require_plugin_draft_checkpoint(server_args: ServerArgs) -> None:
     """
     name = server_args.speculative_algorithm
     entries = _PLUGIN_DRAFTERS.get(name) if name is not None else None
-    if entries is None or name in _IN_TREE_ALGORITHMS:
+    if entries is None or name in IN_TREE_ALGORITHMS:
         return
     if server_args.speculative_draft_model_path is not None:
         return

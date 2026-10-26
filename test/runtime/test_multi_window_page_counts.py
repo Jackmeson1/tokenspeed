@@ -104,6 +104,7 @@ def _pages(specs, **kw):
             max_scheduled_tokens=defaults["max_scheduled_tokens"],
             max_context_len=defaults["max_context_len"],
             decode_input_tokens=1,
+            spec_draft_headroom=0,
             overlap_schedule_depth=0,
             disable_prefix_cache=False,
         ),
@@ -113,6 +114,28 @@ def _pages(specs, **kw):
         max_context_len=defaults["max_context_len"],
     )
     return dict(zip((spec.group_id for spec in specs), pages))
+
+
+def test_recipe_capacity_includes_draft_lane_headroom():
+    model = capacity_model(
+        [_spec("full", "full_history", rows_per_page=1)],
+        prefix_granularity=1,
+        virtual_packing={"full": 1},
+        limits=SchedulerLimits(
+            role=ts.SchedulerConfig.Role.Fused,
+            max_live_requests=1,
+            max_scheduled_tokens=128,
+            max_context_len=100,
+            decode_input_tokens=16,
+            spec_draft_headroom=44,
+            overlap_schedule_depth=1,
+            disable_prefix_cache=True,
+        ),
+    )
+    assert model.concurrent_group_pages(max_total_tokens=100, max_context_len=100) == [
+        100 + 16 + 44
+    ]
+    assert model.single_request_group_pages(token_limit=100) == [100 + 16 + 44]
 
 
 class TestMultiWindowPageCountsTest:

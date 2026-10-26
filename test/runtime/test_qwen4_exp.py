@@ -2215,6 +2215,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
                 max_scheduled_tokens=256,
                 max_context_len=max_tokens,
                 decode_input_tokens=1,
+                spec_draft_headroom=0,
                 overlap_schedule_depth=0,
                 disable_prefix_cache=False,
             ),

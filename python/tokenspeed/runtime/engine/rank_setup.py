@@ -220,7 +220,7 @@ def scheduler_config_from_args(
     """
     geometry = specs.cache_geometry
     has_l3 = server_args.kvstore_storage_backend is not None
-    return make_config(
+    config = make_config(
         num_device_pages=geometry.num_device_pages,
         max_scheduled_tokens=max_scheduled_tokens,
         max_batch_size=max_batch_size,
@@ -242,3 +242,5 @@ def scheduler_config_from_args(
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
     )
+    config.spec_draft_headroom = server_args.speculative_draft_headroom_tokens
+    return config
