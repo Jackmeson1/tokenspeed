@@ -258,23 +258,7 @@ def test_indexer_score_chunk_bound(
     ]
 
 
-# A 40-row score chunk masks part of each CTA's key tile, and in Full mode
-# CTAs span page boundaries.
-@pytest.mark.parametrize("reindex", [False, True])
-@pytest.mark.parametrize("score_chunk", [40, 256])
-def test_index_logits_match_reference(device, reindex, score_chunk):
-    platform = current_platform()
-    if platform.is_cdna4:
-        from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
-            dsv41_index_logits_gfx950 as index_logits,
-        )
-    elif platform.is_cdna5:
-        from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
-            dsv41_index_logits_gfx1250 as index_logits,
-        )
-    else:
-        pytest.skip("AMD Gluon indexer logits")
-
+def _check_index_logits(device, reindex, score_chunk, index_logits):
     g = torch.Generator(device=device).manual_seed(251)
     keys = torch.randn(512, 128, device=device, dtype=torch.bfloat16, generator=g)
     keys *= 0.1
@@ -326,6 +310,32 @@ def test_index_logits_match_reference(device, reindex, score_chunk):
         dots = q_reference[row] @ key_reference[slots].float().T
         expected[row, valid] = (dots.relu() * weights[row].cpu()[:, None]).sum(0)
     torch.testing.assert_close(out.cpu(), expected, atol=2e-4, rtol=2e-4)
+
+
+# A 40-row score chunk masks part of each CTA's key tile, and in Full mode
+# CTAs span page boundaries.
+@pytest.mark.parametrize("reindex", [False, True])
+@pytest.mark.parametrize("score_chunk", [40, 256])
+def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
+    if not current_platform().is_cdna5:
+        pytest.skip("GFX1250 indexer logits")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
+        dsv41_index_logits_gfx1250,
+    )
+
+    _check_index_logits(device, reindex, score_chunk, dsv41_index_logits_gfx1250)
+
+
+@pytest.mark.parametrize("reindex", [False, True])
+@pytest.mark.parametrize("score_chunk", [40, 256])
+def test_gfx950_index_logits_match_reference(device, reindex, score_chunk):
+    if not current_platform().is_cdna4:
+        pytest.skip("GFX950 indexer logits")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
+        dsv41_index_logits_gfx950,
+    )
+
+    _check_index_logits(device, reindex, score_chunk, dsv41_index_logits_gfx950)
 
 
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
