@@ -77,6 +77,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             num_snapshot_pages=1,
             max_retracted_requests=0,
             storage_config=None,
+            prefill_compute_budget=None,
             cache_groups=groups,
         )
     )

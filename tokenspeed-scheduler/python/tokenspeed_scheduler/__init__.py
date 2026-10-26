@@ -29,6 +29,7 @@ from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution p
     CapacityModel,
     ExecutionEvent,
     ExecutionPlan,
+    PrefillComputeConfig,
     RequestSpec,
     Scheduler,
     SchedulerAbort,
@@ -68,6 +69,7 @@ __all__ = [
     # Core
     "Scheduler",
     "SchedulerConfig",
+    "PrefillComputeConfig",
     "StorageConfig",
     "StoragePressure",
     "StorageStats",

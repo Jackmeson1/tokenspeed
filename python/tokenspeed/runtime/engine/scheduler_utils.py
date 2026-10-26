@@ -110,6 +110,7 @@ def make_config(
     num_snapshot_pages: int,
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
+    prefill_compute_budget: list[float] | None,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -145,6 +146,8 @@ def make_config(
             A victim whose image does not fit the Host (L2 pins, pool, rows)
             is aborted by the scheduler instead of imaged.
         storage_config: Explicit asynchronous L3 budgets, or None without L3.
+        prefill_compute_budget: Optional [budget_ms, token_ns, pair_ns, request_ns]
+            calibration for rank-local prefill work; None uses only the token limit.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -183,6 +186,17 @@ def make_config(
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
+    if prefill_compute_budget is not None:
+        from tokenspeed_scheduler import PrefillComputeConfig
+
+        if len(prefill_compute_budget) != 4:
+            raise ValueError(
+                "prefill_compute_budget requires budget_ms, token_ns, pair_ns, request_ns"
+            )
+        budget_ms, token_ns, pair_ns, request_ns = prefill_compute_budget
+        compute = PrefillComputeConfig(budget_ms * 1e6, token_ns, pair_ns, request_ns)
+        compute.validate()
+        cfg.prefill_compute = compute
     cfg.max_batch_size = max_batch_size
     cfg.prefix_granularity = prefix_granularity
 
