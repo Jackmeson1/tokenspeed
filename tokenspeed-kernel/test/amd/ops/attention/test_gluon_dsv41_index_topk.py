@@ -258,16 +258,22 @@ def test_indexer_score_chunk_bound(
     ]
 
 
-# A 40-row score chunk masks part of each CTA's 64-row tile, and in Full mode
+# A 40-row score chunk masks part of each CTA's key tile, and in Full mode
 # CTAs span page boundaries.
 @pytest.mark.parametrize("reindex", [False, True])
 @pytest.mark.parametrize("score_chunk", [40, 256])
-def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
-    if not current_platform().is_cdna5:
-        pytest.skip("GFX1250 indexer logits")
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
-        dsv41_index_logits_gfx1250,
-    )
+def test_index_logits_match_reference(device, reindex, score_chunk):
+    platform = current_platform()
+    if platform.is_cdna4:
+        from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
+            dsv41_index_logits_gfx950 as index_logits,
+        )
+    elif platform.is_cdna5:
+        from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
+            dsv41_index_logits_gfx1250 as index_logits,
+        )
+    else:
+        pytest.skip("AMD Gluon indexer logits")
 
     g = torch.Generator(device=device).manual_seed(251)
     keys = torch.randn(512, 128, device=device, dtype=torch.bfloat16, generator=g)
@@ -294,7 +300,7 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
     width = 40 if reindex else 256
     out = torch.full((2, width), -torch.inf, device=device)
     values, scales, packed_weights = gluon_indexer._pack_index_q(q, weights)
-    dsv41_index_logits_gfx1250(
+    index_logits(
         values,
         scales,
         packed_weights,

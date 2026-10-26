@@ -601,13 +601,7 @@ def _qtile_launch_metadata(grid, kernel, args):
 
 @gluon.jit(
     launch_metadata=_qtile_launch_metadata,
-    do_not_specialize=(
-        "queries",
-        "logits_stride",
-        "num_pages",
-        "table_width",
-        "max_candidates",
-    ),
+    do_not_specialize=("queries", "table_width", "max_candidates"),
 )
 def gluon_dsv41_index_qtile_gfx950(
     q,
@@ -854,9 +848,8 @@ def dsv41_index_logits_gfx950(
     scale_dim = 4
     if candidates is None and table.stride(0) == 0:
         # Every query reads the same page table row: score four queries per CTA.
-        gluon_dsv41_index_qtile_gfx950[
-            (triton.cdiv(queries, 4), triton.cdiv(width, chunk_n))
-        ](
+        grid = (triton.cdiv(queries, 4), triton.cdiv(width, chunk_n))
+        gluon_dsv41_index_qtile_gfx950[grid](
             values,
             scales.view(torch.uint8).reshape(queries, _MFMA_HEADS, scale_dim),
             w,
@@ -888,11 +881,20 @@ def dsv41_index_logits_gfx950(
     # A per-query CTA walks its chunk one key tile at a time; shorter chunks
     # spread the dependent page and key loads over more CTAs.
     score_chunk_size = min(score_chunk_size, 64 if queries <= 64 else 128)
+    if candidates is None and score_chunk_size % 32 and 64 % score_chunk_size:
+        # A Full key tile reads one 64-row page, so a chunk must not straddle
+        # pages: use a multiple of 32 or a divisor of 64 within the bound.
+        score_chunk_size = (
+            score_chunk_size // 32 * 32
+            if score_chunk_size > 32
+            else 16 if score_chunk_size > 16 else 8
+        )
     chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
     # Capacity-wide rows (decode tables) would launch mostly idle CTAs; cap
     # the grid and let each CTA stride over chunks.
     splits = min(triton.cdiv(width, score_chunk_size), max(16, 16384 // queries))
-    gluon_dsv41_index_topk_gfx950[(queries, splits)](
+    grid = (queries, splits)
+    gluon_dsv41_index_topk_gfx950[grid](
         values,
         scales.view(torch.uint8).reshape(queries, _MFMA_HEADS, scale_dim),
         w,
@@ -975,7 +977,11 @@ def _select_radix_pass(
     LBIN: gl.constexpr,
 ):
     """Histogram one key digit of the live keys matching ``prefix``."""
+    # Earlier readers of the histogram finish before it is cleared, and the
+    # clear lands before any warp adds to it.
+    gl.barrier()
     hist_smem.store(gl.zeros([BINS], gl.int32, layout=LBIN))
+    gl.barrier()
     for c0 in range(0, width, BLOCK):
         col = c0 + gl.arange(0, BLOCK, layout=L)
         values = gl.load(row + col, mask=col < width, other=-float("inf"))
@@ -985,6 +991,7 @@ def _select_radix_pass(
             live = live & ((key >> (SHIFT + DIGIT_BITS)) == prefix)
         digit = ((key >> SHIFT) & ((1 << DIGIT_BITS) - 1)).to(gl.int32)
         hist_smem.atomic_scatter_add(ones, digit, axis=0, mask=live)
+    gl.barrier()
     hist = hist_smem.load(LBIN)
     if FIRST:
         remaining = gl.minimum(take, gl.sum(hist, 0))
@@ -1017,6 +1024,7 @@ def _select_top_digit_pass(
 ):
     """Histogram the top key digit of the live columns; return the pivot digit."""
     hist_smem.store(gl.zeros([BINS], gl.int32, layout=LBIN))
+    gl.barrier()
     lane = gl.arange(0, BLOCK, layout=L)
     for c0 in range(0, width, BLOCK):
         col = c0 + lane
@@ -1032,6 +1040,7 @@ def _select_top_digit_pass(
             axis=0,
             mask=values > -float("inf"),
         )
+    gl.barrier()
     hist = hist_smem.load(LBIN)
     remaining = gl.minimum(take, gl.sum(hist, 0))
     at_or_above = gl.cumsum(hist, 0, reverse=True)
@@ -1128,6 +1137,8 @@ def gluon_dsv41_index_topk_select_gfx950(
     SL: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     TOP: gl.constexpr = 32 - RADIX_BITS
     LOW_BITS: gl.constexpr = 32 - 2 * RADIX_BITS
+    # Free picked-id slots hold the int64 maximum, so they rank after all ids.
+    EMPTY_ID: gl.constexpr = 0x7FFFFFFFFFFFFFFF
 
     q = gl.program_id(0).to(gl.int64)
     row = logits + q * logits_stride
@@ -1299,9 +1310,7 @@ def gluon_dsv41_index_topk_select_gfx950(
                 candidates + q * cand_stride + col // 8, mask=pick, other=-1
             ).to(gl.int64)
             logical = block * 8 + (col % 8).to(gl.int64)
-            picked_smem.store(
-                gl.full([2 * TOPK], 0x7FFFFFFFFFFFFFFF, gl.int64, layout=LP)
-            )
+            picked_smem.store(gl.full([2 * TOPK], EMPTY_ID, gl.int64, layout=LP))
             gl.barrier()
             picked_smem.scatter(
                 logical,
@@ -1358,7 +1367,8 @@ def gluon_dsv41_index_topk_select_gfx950(
         threshold = prefix
         # Column-order compaction: keys above the threshold plus the first
         # ``remaining`` ties (equal-score ties may pick any equivalent subset).
-        picked_smem.store(gl.full([2 * TOPK], 0x7FFFFFFFFFFFFFFF, gl.int64, layout=LP))
+        picked_smem.store(gl.full([2 * TOPK], EMPTY_ID, gl.int64, layout=LP))
+        gl.barrier()
         # One packed scan per chunk counts both: low 16 bits the keys above the
         # threshold, high 16 bits the ties (a chunk holds fewer than 2**16).
         n_above = 0
@@ -1477,7 +1487,8 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
     ):
         raise ValueError(f"live_widths must be int32/int64 [{queries}]")
     cand = logits if candidates is None else candidates
-    gluon_dsv41_index_topk_select_gfx950[(queries,)](
+    grid = (queries,)
+    gluon_dsv41_index_topk_select_gfx950[grid](
         logits,
         cand,
         logits if live_widths is None else live_widths,
@@ -1568,9 +1579,8 @@ def launch_gluon_dsv41_index_block_select_gfx950(
     )
     block_count = torch.empty(queries, dtype=torch.int32, device=logits.device)
     per_cta = 256
-    gluon_dsv41_index_block_max_gfx950[
-        (queries, min(triton.cdiv(blocks, per_cta), max(1, 4096 // queries)))
-    ](
+    grid = (queries, min(triton.cdiv(blocks, per_cta), max(1, 4096 // queries)))
+    gluon_dsv41_index_block_max_gfx950[grid](
         logits,
         visible,
         block_max,
