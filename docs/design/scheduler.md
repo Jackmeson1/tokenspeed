@@ -603,10 +603,11 @@ not count it — until `CompleteWriteBack` publishes the Host entry and drops th
 pin. Nothing else needs to know the copy is in flight, so the runtime copies
 on its own stream and no forward waits. A cached block is never written again
 by its owner (prefix reuse already depends on that), so the pin alone makes
-the copy race-free. Both guards share one ticket (`StartPendingStores(guard)`
-drains the publication queue; `StartRetractionStores` builds the image's L2
-leg from the victim's tables), and the op carries `source_pinned` to the
-runtime, which branches on the guard and never on the reason.
+the copy race-free. Both guards share one ticket
+(`StartPendingStores(guard, tables, num_tokens)` drains the publication queue,
+a finish's boundary from its tables first; `StartRetractionStores` builds the
+image's L2 leg from the victim's tables), and the op carries `source_pinned`
+to the runtime, which branches on the guard and never on the reason.
 
 **Per-victim quiescence, not global.** A request whose own forward is still
 out must not be retracted — its result would land on pages it no longer owns,
@@ -958,7 +959,8 @@ have to test; a state the phases do not know is the one way to hold pages and
 be invisible at once.
 
 **Finish or abort while suspended** drops the state: from `Retracted`, the
-pinned Host entries become ordinary evictable entries at once and the pool
+pinned Host entries become ordinary evictable entries at once, dated as the
+retraction left them (`cache-concepts.md`, two tiers), and the pool
 blocks return when the copies still writing them land (the tickets hold the
 refs); from `Restoring`, the rebuilt tables are freed and the restore's ACK
 only drops its pins — it republishes nothing, because the token descriptors

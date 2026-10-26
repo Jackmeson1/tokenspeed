@@ -48,16 +48,24 @@ public:
     // gets the same guard. Boundary publication and finish drain with
     // kPinnedUntilAck; a retraction's stream-ordered L2 leg does not use the
     // queue -- StartRetractionStores builds it from the victim's tables.
-    std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard);
+    // A finish passes its tables and computed frontier, empty for a live
+    // request's publications and a finish that computed nothing: the
+    // boundary it leaves is stored ahead of the queued candidates, and its
+    // Host copies -- already cached, carried by a store in flight, or stored
+    // now -- are dated by the batch's epochs
+    // (CacheCoordinator::TakeStoreEpochs); no other Host entry is refreshed.
+    std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard, std::span<const BlockTable> tables,
+                                                         std::int32_t num_tokens);
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     // A retraction image and the two store ops that fill it. The L2 leg is a
     // stream-ordered write-back of the published pages not yet on Host (keys
     // already Host-cached or carried by an in-flight store are pinned, not
-    // copied again); the tail leg is the snapshot store of every other data
-    // slot plus the slot-state blob. pending_store_ops lists every op the
-    // image waits for -- both legs' own ops and any earlier in-flight store
-    // carrying one of its keys.
+    // copied again), dated like a finish's (the retraction's boundary);
+    // the tail leg is the snapshot store of every other data slot plus the
+    // slot-state blob. pending_store_ops lists every op the image waits for
+    // -- both legs' own ops and any earlier in-flight store carrying one of
+    // its keys.
     struct RetractionStores {
         RetractionImage image;
         std::optional<WriteBackOperation> host_store;
@@ -70,7 +78,7 @@ public:
     // (after evicting unpinned entries) falls back to the snapshot pool, and
     // the retraction is refused only when the pool cannot hold tail plus
     // fallback -- then nothing is kept, though unpinned Host entries evicted
-    // for the attempt stay evicted.
+    // for the attempt stay evicted and the refreshed ones stay refreshed.
     // blob_slot is the slot-state blob's arena slot the tail leg exports into;
     // the store shares it with the Retracted state so an abort before the ACK
     // cannot hand the slot to a new victim while the export still writes it.
@@ -126,14 +134,17 @@ public:
 
 private:
     // A store ticket always pins its Host destination; the ACK's one job is
-    // publishing that entry (CacheHostBlock). Whether it also pins the Device
-    // source is the op's StoreSourceGuard: kPinnedUntilAck keeps the source
-    // cached and unevictable until the ACK, kStreamOrdered leaves it empty
-    // and relies on the runtime ordering the copy ahead of any reuse.
+    // publishing that entry (CacheHostBlock) at access_epoch, the date its
+    // batch gave it (a later batch whose boundary holds the key re-dates it).
+    // Whether it also pins the Device source is the op's StoreSourceGuard:
+    // kPinnedUntilAck keeps the source cached and unevictable until the ACK,
+    // kStreamOrdered leaves it empty and relies on the runtime ordering the
+    // copy ahead of any reuse.
     struct StoreTicket {
         CacheKey key;
         CacheBlockRef device_block_ref;
         CacheBlockRef host_block_ref;
+        std::uint64_t access_epoch{0};
     };
 
     struct InFlightWriteBack {
@@ -168,6 +179,11 @@ private:
     };
     using InFlightHostBlocks = std::unordered_map<CacheKey, InFlightHostBlock, CacheKeyHash>;
     InFlightHostBlocks inFlightHostBlocks() const;
+    // A retraction's boundary keys Host does not hold, with their epochs.
+    using BoundaryEpochs = std::unordered_map<CacheKey, std::uint64_t, CacheKeyHash>;
+    // Re-dates the boundary keys an earlier store still carries: its ACK
+    // publishes them at this batch's epochs.
+    void redateInFlight(const BoundaryEpochs& boundary);
 
     CacheCoordinator& coordinator_;
     std::unordered_map<std::uint32_t, InFlightWriteBack> write_backs_;

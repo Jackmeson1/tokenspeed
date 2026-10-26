@@ -514,6 +514,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         .prefix_hashes = std::move(match.prefix_hashes),
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
+        // A remote landing reads no local checkpoint at the hit.
+        .resume_tokens = source == fsm::PrefillSource::kLocal ? hit_tokens : 0,
     };
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
@@ -878,6 +880,7 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
     }
     publishCompletedPrefix(victim);
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
+    refreshResumeBoundary(victim, victim.CacheProgressRef());
 
     // The blob slot is shared with the store that exports into it (and later
     // the restore that imports from it): an abort before either ACK leaves

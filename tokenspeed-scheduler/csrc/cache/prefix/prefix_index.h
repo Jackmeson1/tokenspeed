@@ -131,7 +131,7 @@ public:
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
-        cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
+        entry_it->eviction_it = cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it).first;
         if (newly_cached != nullptr) {
             newly_cached->emplace_back(key, block_ref);
         }
@@ -186,18 +186,19 @@ public:
     }
 
     // The key this tier publishes `block_ref` under, when the entry's block is
-    // this very block (identity, not just location). A retraction asks this
-    // of each data slot to decide which tier images it.
-    std::optional<CacheKey> KeyOf(const BlockPool& pool, const CacheBlockRef& block_ref) const {
+    // this very block (identity, not just location); valid until the entry is
+    // evicted. A retraction asks this of each data slot to decide which tier
+    // images it.
+    const CacheKey* KeyOf(const BlockPool& pool, const CacheBlockRef& block_ref) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr || !block_ref) {
-            return std::nullopt;
+            return nullptr;
         }
         ConstCacheEntryIterator entry_it = findEntry(*cache_index, block_ref->Location());
         if (entry_it == cache_index->entries.end() || entry_it->block_ref != block_ref) {
-            return std::nullopt;
+            return nullptr;
         }
-        return entry_it->key;
+        return &entry_it->key;
     }
 
     std::optional<CachedBlockMetadata> MetadataFor(const BlockPool& pool, CacheBlockLocation location) const {
@@ -317,6 +318,23 @@ public:
         return true;
     }
 
+    // Raises key's entry in pool to access_epoch, never dating it back; false
+    // when pool does not cache key.
+    bool Touch(const BlockPool& pool, const CacheKey& key, std::uint64_t access_epoch) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return false;
+        }
+        CacheEntryIterator entry_it = findEntry(*cache_index, key);
+        if (entry_it == cache_index->entries.end()) {
+            return false;
+        }
+        if (entry_it->last_access_epoch < access_epoch) {
+            touchEntry(*cache_index, entry_it, access_epoch);
+        }
+        return true;
+    }
+
     // Pins the probed hits: marks them acquired at access_epoch and returns
     // owning references aligned with probe.hits.
     PrefixMatch AcquireMatched(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
@@ -372,6 +390,8 @@ private:
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         // Set only after a successful request admission acquires this entry.
         bool was_acquired{false};
+        // This entry's node in by_eviction_order, so re-keying needs no search.
+        EvictionOrderMap::iterator eviction_it{};
     };
 
     struct CacheEntries {
@@ -403,17 +423,22 @@ private:
         };
     }
     // The only writer of last_access_epoch: an entry's location never moves, so
-    // re-keying costs O(log N) per changed epoch, including on prefix hits, in
-    // exchange for admission's ordered traversal and early exit. Continued
-    // requests can republish under an older epoch, so moving entries to the
-    // back of an LRU list would not preserve this order.
+    // re-keying moves its by_eviction_order node -- amortized O(1) only when
+    // the node becomes the map's maximum (a hit or a Host refresh at a new
+    // newest epoch); O(log N), like an erase and re-insert, when an entry
+    // sharing its epoch orders after it or the epoch is older -- in exchange
+    // for admission's ordered traversal and early exit. Continued requests can
+    // republish under an older epoch, so moving entries to the back of an LRU
+    // list would not preserve this order.
     void touchEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t access_epoch) {
         if (entry_it->last_access_epoch == access_epoch) {
             return;
         }
-        cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
+        EvictionOrderMap::node_type node = cache_index.by_eviction_order.extract(entry_it->eviction_it);
         entry_it->last_access_epoch = access_epoch;
-        cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
+        node.key() = evictionOrder(*entry_it);
+        entry_it->eviction_it =
+            cache_index.by_eviction_order.insert(cache_index.by_eviction_order.end(), std::move(node));
     }
 
     CacheEntries& cacheEntries(const BlockPool& pool) {
@@ -450,7 +475,7 @@ private:
         return index_it == cache_index.by_location.end() ? cache_index.entries.end() : index_it->second;
     }
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
-        cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
+        cache_index.by_eviction_order.erase(entry_it->eviction_it);
         cache_index.by_key.erase(entry_it->key);
         cache_index.by_location.erase(entry_it->block_ref->Location());
         cache_index.entries.erase(entry_it);

@@ -51,6 +51,10 @@ struct CacheProgress {
     // there publishes its natural checkpoint where the KV is already cached,
     // so the next prompt resumes at the junction. Zero once passed or absent.
     std::int32_t junction_tokens{0};
+    // Where a local first admission resumed (its prefix hit), zero without
+    // one: the request read that boundary's entries then, which its final
+    // publication refreshes on Host.
+    std::int32_t resume_tokens{0};
     // The in-forward State checkpoint a scheduled forward writes
     // (SchedulerConfig::state_checkpoint_in_forward): the page boundary it
     // sits at and, per cache group, the block it is written to (null for
