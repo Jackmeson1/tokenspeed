@@ -298,10 +298,9 @@ finishes it first. A decode settles after the target's decode metadata and
 before the draft's, so what a forward queues before its settle runs beside
 the round and must leave alone what the round uses: `future_*`, the draft KV
 cache and decode metadata, the drafter's buffers, the kernel workspace and
-collective state. EAGLE-Harness chains a round's captured graphs on the GPU,
-behind the decode graph (`BaseDrafter.replay_decode_graph`), so what the
-forward queues after that graph (the verified-state commit, the outputs) runs
-beside the round too; an eager round polls a pinned flag to launch each depth.
+collective state. A drafter that replays on another stream through
+`BaseDrafter.replay_decode_graph` must order the forward stream after its
+decode graph before the verified-state commit and output copies.
 
 A JIT compilation on the forward thread is the same kind of stall, only
 longer: the round waits 100 ms to seconds while a kernel compiles for a new

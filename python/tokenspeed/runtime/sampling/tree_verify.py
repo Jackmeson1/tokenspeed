@@ -82,7 +82,7 @@ class TreeVerifyBatch:
 
     parents: torch.Tensor
     depths: torch.Tensor
-    draft_q: DraftTreeQ | None
+    draft_q: DraftTreeQ | None = None
 
 
 def accepted_path_rows(path: torch.Tensor) -> torch.Tensor:

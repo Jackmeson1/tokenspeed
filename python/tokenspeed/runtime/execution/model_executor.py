@@ -24,7 +24,6 @@ import gc
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
@@ -57,9 +56,6 @@ from tokenspeed.runtime.execution.accept_simulation import (
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
-from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
-    EagleHarnessConfig,
-)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -427,8 +423,6 @@ class ModelExecutorConfig:
 
     # ====== SPEC =========
     spec_algo: str | None = None
-    # EAGLE-Harness drafting (EAGLE4 with --speculative-exec-mode >= 0), else None.
-    eagle_harness: EagleHarnessConfig | None = None
     spec_num_steps: int | None = None
     # Verify window width: spec_num_steps + 1 for a chain, the tree's node budget otherwise.
     spec_num_tokens: int | None = None
@@ -459,8 +453,8 @@ class ModelExecutorConfig:
 
     @property
     def spec_draft_tree(self) -> bool:
-        """Drafts go through the draft-tree path: topk > 1, or EAGLE-Harness chains."""
-        return self.spec_topk > 1 or self.eagle_harness is not None
+        """Whether drafts go through the draft-tree path."""
+        return self.spec_topk > 1
 
     @staticmethod
     def from_server_args(
@@ -535,9 +529,6 @@ class ModelExecutorConfig:
                 server_args.mapping.pp_group if server_args.mapping.has_pp else None
             ),
             spec_algo=server_args.speculative_algorithm,
-            eagle_harness=EagleHarnessConfig.from_server_args(
-                server_args, model_config
-            ),
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
             enable_speculative_sampling=server_args.enable_speculative_sampling,
@@ -635,8 +626,7 @@ class ModelExecutor:
             if model_runner.model_config.requires_request_token_history
             else 0
         )
-        # Trees keep their draft q per tree instead (bind_tree).
-        if config.enable_speculative_sampling and not config.spec_draft_tree:
+        if config.enable_speculative_sampling:
             if config.spec_algo is None:
                 raise ValueError(
                     "enable_speculative_sampling needs a speculative drafter to "
@@ -674,12 +664,6 @@ class ModelExecutor:
                 config.spec_algo,
                 None if draft_model_runner is None else draft_model_runner.model,
             )
-            if config.eagle_harness is not None:
-                from tokenspeed.runtime.execution.drafter.eagle_harness.drafter import (
-                    EagleHarness,
-                )
-
-                DrafterImpl = partial(EagleHarness, harness=config.eagle_harness)
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,

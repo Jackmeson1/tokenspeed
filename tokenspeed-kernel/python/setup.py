@@ -354,9 +354,7 @@ def _ensure_cuda_compiler() -> None:
 
 
 # Groups compiled without -use_fast_math, to match torch or Python bit for bit.
-PRECISE_MATH_GROUPS = frozenset(
-    {"eagle_harness_tree", "eagle_harness_policy", "eagle4_candidate"}
-)
+PRECISE_MATH_GROUPS = frozenset()
 
 # Kernel groups: each entry produces one .so file.
 # Format: (name, [source_files], extra_ldflags) or
@@ -453,36 +451,6 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "merge_state.cu",
         ],
         [],
-    ),
-    (
-        "eagle_harness_tree",
-        [
-            CUDA_CSRC_DIR / "eagle_harness_tree.cu",
-        ],
-        [],
-    ),
-    (
-        "eagle_harness_policy",
-        [
-            CUDA_CSRC_DIR / "eagle_harness_policy.cu",
-        ],
-        [],
-    ),
-    (
-        "eagle4_candidate",
-        [
-            CUDA_CSRC_DIR / "eagle4_candidate.cu",
-        ],
-        [],
-    ),
-    (
-        # Device-side CUDA graph launch needs relocatable device code linked with cudadevrt.
-        "eagle_harness_chain",
-        [
-            CUDA_CSRC_DIR / "eagle_harness_chain.cu",
-        ],
-        ["-lcudadevrt"],
-        ["-rdc=true"],
     ),
     (
         "mhc_big_fuse",

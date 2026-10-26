@@ -166,8 +166,7 @@ write them before the lane forward reads them.
 A drafter may leave its round pending past the forward (`BaseDrafter.finish_round`)
 and write the next round's tree in the next forward's settle (`complete_round`,
 `event-loop.md`), which runs before that forward's draft refresh, so its lanes
-read the tables they started on. EAGLE-Harness does, and lists where it departs
-from this document in `drafter/eagle_harness/__init__.py`.
+read the tables they started on.
 
 ### The drafter scores, the tree selects
 
@@ -210,7 +209,7 @@ executor refuses tree drafting with them at startup.
 ## Scope
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
-drafter refuses trees at startup) and EAGLE4; `greedy`, `triton` and `flashinfer` sampling backends; the `trtllm`
+drafter refuses trees at startup); `greedy`, `triton` and `flashinfer` sampling backends; the `trtllm`
 attention backend, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
 KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,

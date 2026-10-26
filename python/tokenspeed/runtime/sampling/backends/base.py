@@ -135,11 +135,7 @@ class SamplingBackendConfig:
             logprob_order=server_args.logprob_order,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
-            # Trees verify against their draft q tables, not recorded draft probs.
-            enable_speculative_sampling=(
-                server_args.enable_speculative_sampling
-                and not server_args.speculative_draft_tree
-            ),
+            enable_speculative_sampling=server_args.enable_speculative_sampling,
             spec_reject_draft_prob_threshold=(
                 server_args.spec_reject_draft_prob_threshold
             ),
