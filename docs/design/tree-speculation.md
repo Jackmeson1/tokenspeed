@@ -36,7 +36,7 @@ Everything downstream sees a chain.
 A chain is the tree `parent[i] = i - 1`. With `topk == 1` no tree state exists
 and the chain path runs unchanged. With `topk > 1` the output processor and the
 draft step-0 forward are the chain's. The named tree-only pieces are candidate
-selection after step 0 (`Eagle._seed_tree_lanes`) and, in a stateful backend's
+selection after step 0 (`Eagle.seed_tree`) and, in a stateful backend's
 commit, the steps that read `accepted_path` (the GDN source row and replay
 payload packing).
 
@@ -131,24 +131,33 @@ cache group, at that group's own verify window.
 Drafting steps `1 .. S-1` run `K` lane rows per request. Step `s` lane `r`
 writes draft-cache slot `frontier + (s - 1) * K + r` through the attention
 prologue (`publish_draft_step_locations` with `K` tokens per request), like the
-chain's draft steps (`(S - 1) * K <= N`, checked in `server_args`). Their K/V
+chain's draft steps. Their `(S - 1) * K` lane slots are independent of `N`.
+For native trees both the lane mask and the verify mask fit one 64-bit word
+and `S <= 10` (the packed depth-first sort key of `DraftTree`), checked in
+`server_args`. Their K/V
 are valid only while the round drafts its tree. The target's verify overwrites
 the window.
 
 Draft writes reach past the verify window: lanes up to
-`frontier + (S - 1) * K - 1`, chain steps up to `frontier + S - 2`. Both stay
-inside the next verify window (`(S - 1) * K <= N` and `S - 1 <= N`), so a
-speculative decode on a decoding role reserves one more verify window behind
-its own, from the first decode on (the prefill role hands off before drafting
-past its first window). That window stops at the request's token limit (prompt
-plus `max_new_tokens`), which admission may have prepaid in full, so it never
-demands a page past that limit. A request without a declared budget reserves
-no such window: admission validated only its first verify window. Known
-limitation: within `N` tokens of the
-limit some draft writes (chain steps, block drafters and tree lanes alike)
-still land past it. A position past the allocated extent resolves to the dummy
-slot, and attention reads it through page 0. This costs draft acceptance
-only. The next verify rewrites target KV.
+`frontier + (S - 1) * K - 1`, chain steps up to `frontier + S - 2`. These writes
+fit the scheduler's draft reservation. Ordinary speculation reserves one more
+verify window on a decoding role, capped at the request's token limit and
+omitted without a declared budget. Trees additionally require
+`H = (S - 1) * K` slots past the accepted frontier, even at that limit.
+`SchedulerConfig.spec_draft_headroom` carries `H`; the scheduler reserves the
+larger of that scratch extent and the ordinary next-window extent, once.
+The completing prefill and a restored request also reserve the scratch, so
+the first tree does not depend on accepted-token feedback. State cache groups
+still hold two slots.
+
+`N` remains the target verify width, output stride and scheduling token cost.
+For example, `K=4, S=10, N=16` uses 36 scratch slots after its 16-token verify
+window. Overlap protects another `N` tokens, not another `H`. The physical
+context pad adds `H` to the existing three verify spans; logical context and
+generation limits remain unchanged. Cache recipes pass `H` to the scheduler's
+capacity model for both single-request bounds and concurrent pool sizing.
+The output processor continues reporting accepted-token counts; it does not
+own this fixed reservation.
 
 Lane attention is the same cascade with `R = K` over the draft paged cache:
 every lane row sees the accepted frontier and, inside the window, only its
@@ -170,7 +179,7 @@ read the tables they started on.
 
 ### The drafter scores, the tree selects
 
-`Eagle._score_candidates` is the one place a drafter decides how to score
+`Eagle.tree_candidates` is the one place a drafter decides how to score
 candidates (today `logprob_topk` over the full draft vocabulary). `DraftTree`
 only records `(scores, tokens)` and selects. A child's score is at most its
 parent's (`draft_tree_expand` clamps child log-probabilities at 0). A new
@@ -199,17 +208,21 @@ keyed by `(seed, position)`. For a tree the key is the position predicted by the
 parameters and its offset advanced by its depth, so the token accepted at every
 position is the one plain decoding samples there. Acceptance is the greedy tree
 walk over those draws, accepting a child when it equals its parent's draw.
-The flashinfer backend instead accepts every tree by recursive rejection
-sampling (`TreeRejectionSampler`), against the draft q that drew a sampled
-node's children (`RuntimeStates.future_draft_q`), exact in distribution rather
-than the plain-decoding draw.
+The flashinfer backend refuses trees unless the selected drafter explicitly
+binds a plugin verifier with `bind_tree_sampler(factory)` before tree setup.
+The factory receives scalar pools, padded batch capacity and device. Its
+`TreeSampler` fills predictions, accepted paths and lengths from logits,
+ancestry and backend-generated uniforms. The backend owns broadcasts and
+logprob output. Binding is per instance, so installing a plugin leaves native
+EAGLE3 and MTP verification on the greedy or Triton path. Recorded proposal
+tables (`RuntimeStates.future_draft_q`) are optional inputs to the plugin.
 Backends that can do neither keep `supports_tree_verify = False` and the
 executor refuses tree drafting with them at startup.
 
 ## Scope
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
-drafter refuses trees at startup); `greedy`, `triton` and `flashinfer` sampling backends; the `trtllm`
+drafter refuses trees at startup) and plugin drafters that implement `bind_tree`; `greedy` and `triton` sampling backends, or `flashinfer` with an explicitly bound plugin sampler; the `trtllm`
 attention backend, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
 KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
@@ -227,6 +240,22 @@ cannot silently skip a child. Sliding window and attention sinks are the named
 exception: they are per layer and per call, so the `trtllm` and `tokenspeed_mla`
 forwards refuse them (`trtllm_mla` takes no sliding window at all), except a
 sliding window in the `trtllm` draft lanes.
+
+A plugin drafter enters the same path, not a second one. `bind_tree` receives
+the `TreeSpec`; each round `run` returns the next round's `N` candidate tokens
+per request in node order and writes their parents to `draft_parent_buf`
+(`parent[0] = -1`, every parent before its child), which the executor carries
+in `future_parent_map` like the Eagle drafter's. Its lane writes obey the
+`(S - 1) * K <= N` window above, with `K` and `S` from
+`--speculative-eagle-topk` and `--speculative-num-steps`.
+
+A drafter built on `Eagle` keeps the lane loop and replaces only its tree
+policy (capability `drafter.tree_policy`): `tree_candidates` ranks each draft
+row's candidates, `seed_tree` and `expand_tree` choose each step's K lanes and
+write their ancestry into `tree_lanes.lane_mask`, and `verify_window` picks the
+next round's `N` nodes and their parents. `bind_tree_lanes` binds the lanes for a
+drafter that builds its own tree state. Each runs inside the decode graph, with
+fixed shapes per batch and no host synchronisation.
 
 ## Not scheduler or cache state
 

@@ -607,21 +607,88 @@ parser option keeps its existing behavior.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--speculative-config` | JSON speculative decoding configuration. |
+| `--speculative-config` | JSON speculative decoding configuration. Keys: `method`, `model`, `num_speculative_tokens`, `synthetic_acceptance_length`, and `method_config` (same as `--speculative-algorithm-config`). |
 | `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `MTP`, `DFLASH`, `DSPARK`, or `DUMMY`. `DUMMY` generates deterministic candidates without a draft checkpoint; it tests target multi-token verification, not draft-model quality. Set `--speculative-num-draft-tokens` above 1 and do not pass a draft model path. |
+| `--speculative-algorithm-config` | JSON object of settings for a plugin-registered `--speculative-algorithm`. The drafter receives it uninterpreted through `BaseDrafter.configure_algorithm`. Refused for in-tree algorithms. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
-| `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
-| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters (see below). Off by default. |
+| `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree (`EAGLE3`, `MTP`, or a plugin algorithm whose drafter implements `bind_tree`). |
+| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and plugin trees with recorded proposal probabilities (see below). Off by default. |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
-| `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` draft. |
+| `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` draft, or a plugin algorithm registered with `captures_aux_hidden_states=True`. Defaults to the draft config's `eagle_aux_hidden_state_layer_ids`. |
 | `--disable-replay-ssm` | Stage every verify position's recurrent state instead of replaying the accepted tokens. ReplaySSM is on by default for supported Qwen GDN and Nemotron-H Mamba2 targets; `--enable-replay-ssm` is accepted as a deprecated no-op. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+### Plugin drafter configuration
+The `drafter.algorithm_config` and `drafter.aux_hidden_capture` plugin
+capabilities add `BaseDrafter.configure_algorithm` and the
+`register_drafter(..., captures_aux_hidden_states=...)` declaration. A plugin
+checks `tokenspeed.runtime.plugins.PLUGIN_CAPABILITIES` for the contracts it
+uses; `PLUGIN_API_VERSION` changes only when a change breaks existing plugins.
+
+Configuration is a JSON object passed once after drafter construction, before
+target, sampling, and tree binding. Omitting it skips the hook. A drafter that does not implement
+the hook rejects supplied configuration instead of ignoring it.
+
+Auxiliary capture is an algorithm-wide startup contract. Declare it on the
+algorithm default before registering model-scoped drafters, which inherit that
+contract. Replacing the default changes capture only when no scoped entries
+exist. Failed plugin registration restores the previous contract. Capture uses
+`--eagle3-layers-to-capture` or the draft configuration's auxiliary layer IDs.
+A capture-enabled plugin requires a target implementing
+`AuxHiddenStateCaptureTarget`; an unsupported target is rejected at startup.
+A draft model profile naming its attention configuration's ordinary cache family
+uses the target cache recipe, like the corresponding built-in draft; a profile
+naming a different family still requires explicit heterogeneous-cache support.
+
+A plugin algorithm may draft trees (`--speculative-eagle-topk` above 1); its
+drafter implements `BaseDrafter.bind_tree`. Registering with
+`uses_tree_layout=True` (capability `drafter.tree_layout`) makes the runtime bind
+explicit parents and draft lanes for its chains as well, so one drafter serves
+chains and trees through the same verify path. Like auxiliary capture, the tree
+layout is declared on the algorithm default.
+
+These startup contracts do not change speculative sampling, cache admission,
+or request retraction. The existing restrictions on those paths
+still apply to plugin algorithms.
+
+### Recorded proposal distributions
+
+Plugins requiring verification against sampled draft proposals negotiate
+`sampling.draft_tree_q`. `DraftTreeQ` records candidate probabilities and token
+IDs plus each node's proposal slot and draw position. The runtime owns its
+request-slot allocation, reset and retraction lifecycle through
+`RuntimeStates.init_draft_tree_q`. `TreeVerifyBatch.draft_q=None` preserves the
+native deterministic-proposal path and allocates no proposal storage.
+
+Only sampling backends with `verifies_draft_tree_q=True` consume recorded q.
+FlashInfer uses the generic tree rejection sampler, while other backends keep
+their existing tree-verification behavior. Plugins must reject sampled proposal
+configuration when the selected backend does not verify q.
+
+### Plugin-owned rounds
+
+`drafter.round_protocol` names the existing prepare, replay, finish and complete
+lifecycle plus capture and release of plugin graphs. Capture receives the
+previous graph bucket as `lo_bs`, and `has_round_graphs` defaults to false.
+The runtime completes pending drafting before request-slot or cache changes.
+No-op hooks leave native drafting and graph replay unchanged.
+
+`drafter.tree_lanes` adds `Eagle.bind_tree_lanes` and
+`AttentionBackend.begin_tree_lanes(bs, live_bs)`. A plugin starts a round by
+snapshotting live page mappings and nulling padding before lane work.
+`attention.windowed_tree_lanes` uses those per-lane tables with the window
+frozen at the accepted prefix, preserving the attention backend's cascade.
+Plugins that never start snapshots continue using ordinary decode tables.
+
+The reserved `suspend_drafting`, `verify_widths` and `round_verify_width` methods
+keep their native defaults. Overrides fail at startup until their separate
+capabilities are implemented. These capabilities are not advertised here.
 
 ### Synthetic acceptance length
 
@@ -666,7 +733,9 @@ the checkpoint's resolved verify width when the sampler is initialized.
 must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 1
 they draft a tree instead, and `--speculative-num-draft-tokens` is its node
 budget (root included). Set it explicitly: topk 1..16, steps 1..10,
-`(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
+at most 64 lane slots (`(steps - 1) * topk`), and at most 64 nodes. Lane
+slots are reserved separately from the node budget: topk 4, steps 10 and 16
+nodes reserve 36 scratch slots without widening target verification. Trees need the `trtllm`
 attention backends (`trtllm_mla` or `tokenspeed_mla` for MLA models) and the `greedy`, `triton` or `flashinfer` sampling backend; see
 [draft-tree speculation](../design/tree-speculation.md) for the full scope.
 

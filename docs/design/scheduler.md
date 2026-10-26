@@ -137,6 +137,13 @@ It picks the rule by the group's kind, never by call site:
 - *State* groups reserve nothing: their table is two slots whatever the
   prompt length, and a decode step writes the live slot in place (§1.2).
 
+Tree drafting adds `spec_draft_headroom` scratch slots to a completing
+prefill's reservation and to a completed request's restore reservation.
+This capacity does not change the forward input width or the accepted-token
+feedback; the first draft needs it before any such feedback arrives.
+Generation prepayment also includes these scratch slots beyond its prepaid
+token frontier, so a request exempt from ordinary retraction can finish.
+
 The decode slot is reserved on **every** role, the P role included. A P node
 never decodes locally, but with speculation configured the forward that
 completes a prompt runs the drafter once and writes its candidate block into
@@ -429,8 +436,8 @@ recipes size a pool from the same model before the arena is allocated
 demand at `max_batch_size` live requests), and then lets the `Scheduler`
 bound requests against the pool they sized. The per-request working set —
 `decode_width + overlap_schedule_depth * decode_width` protected tokens, the
-next verify window a speculative decode's draft steps write on the roles that
-decode (`DraftWindowTokens`, which `scheduleDecode` reserves from), the
+larger of the next verify window and explicit tree lane headroom
+(`DraftWindowTokens`, which `scheduleDecode` reserves from), the
 two slots of a State group (`kStateSlots`), the most blocks a sliding
 window can need behind a boundary (one more than behind a page-aligned one,
 `SlidingWindowBlocks`) — exists in that one file; neither side restates it. The two answers are tied by an
@@ -468,7 +475,12 @@ Speculative decode admission grows from the committed token frontier plus the ve
 spans still in flight, the span being scheduled and the next span, which the
 draft steps write; that last span stops at the request's token limit, so it
 stays inside the admission limit, a request without a declared budget reserves
-none, and the capacity model charges it per live request. Already reserved slots
+none, and the capacity model charges it per live request. Explicit tree lane
+headroom is a physical scratch requirement beyond the verify frontier even
+at the token limit, so the single-request bound includes it too. It shares
+the next-window reservation: the larger extent wins, rather than summing
+the two. The overlap protection still counts verify widths only.
+Already reserved slots
 cover that extent first. A prefill interruption must not charge the same
 speculative slots again when decode resumes; otherwise rejected draft tokens
 accumulate in the logical tables beyond the context-length bound.
