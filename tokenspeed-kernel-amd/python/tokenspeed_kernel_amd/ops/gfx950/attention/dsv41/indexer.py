@@ -344,8 +344,11 @@ def _qtile_load_keys(
     dot_b_layout: gl.constexpr,
     b_scale_layout: gl.constexpr,
 ):
-    # A 32-row tile starts at a multiple of 32, so it never crosses a 64-row
-    # page and needs one scalar page lookup.
+    # The live columns [tile_start, end) stay within one 64-row page, so one
+    # scalar page lookup suffices: tiles are 32-aligned (shared-table scorer,
+    # chunks that are a multiple of 32), or the chunk size divides 64 and
+    # ``end`` is clamped to the chunk's end within that page. Do not mask by
+    # anything wider than the chunk end.
     page = gl.load(table + gl.minimum(tile_start // 64, table_width - 1)).to(gl.int64)
     page_ok = (page >= 0) & (page < num_pages)
     base = cache + gl.where(page_ok, page, 0) * page_stride_bytes
