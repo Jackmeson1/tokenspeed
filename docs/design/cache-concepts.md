@@ -310,6 +310,48 @@ persistent convolution pool keeps its cache dtype, independently of activation
 dtype. Records and position/generation stamps cover the current verify round;
 they are transient workspace, not prefix-cache entries.
 
+The retained-history checkpoint format adds fields to that same state block:
+`replay_correction`, `replay_key`, `replay_decay` and `replay_length`. The first
+three are FP32 `[heads, capacity, channel]` fields containing corrections,
+normalized keys and multiplicative per-token decays. Capacity is the total
+number of slots shared by accepted history and the current verify candidates;
+there is no separate per-round U/K/decay records allocation in this path. The
+INT32 length publishes only the accepted prefix. Zero means the dense base
+alone, even if unused entries contain stale or rejected candidates. Applying
+that prefix in token order reconstructs the accepted endpoint. The convolution
+window describes that endpoint, not the older dense base.
+
+Verify writes candidate records directly into the private live page after
+its accepted prefix. It reserves the entire candidate window before writing:
+`history_length + candidate_count <= capacity`. If the window would not fit,
+verify consolidates only accepted history into the dense base and starts at
+slot zero; the candidate count itself must fit within capacity. Equality fits
+without consolidation. If the input checkpoint is on another page, verify
+reconstructs its accepted endpoint into the private live page's dense base
+and starts there with an empty history. Published input pages remain read-only.
+Both cases keep consolidation in verify.
+
+Writing candidates leaves the accepted length unchanged. After acceptance,
+commit advances that length by the accepted count without copying U/K/decay.
+The next verify's append offset is the accepted history length, never the
+previous candidate window's end. For example, writing four candidates at
+slots 0..3 and accepting two makes the next four candidates use slots 2..5;
+rejected slots are reused immediately, without clearing or leaving gaps.
+Publication must follow completion of the candidate writes.
+Commit still updates convolution history for the accepted tokens; original
+QKV retention and per-round routing/validity metadata are separate from these
+record fields. Stable pool storage and device-side page/offset selection serve
+both eager execution and CUDA graphs, for both T=1 and speculative decode.
+
+These fields share the base's cache group and block ownership. Whole-block
+copy, zeroing, prefix reuse, retraction and transfer must carry the complete
+checkpoint. Head-valued fields partition with attention TP; the length is
+replicated. The cache planner includes all fields when sizing a state plane;
+retained history is not counted again as transient verify workspace. This
+storage contract does not enable retention: the serving Kimi recipe still
+declares capacity zero until all checkpoint consumers support reconstruction.
+Other recipes retain their existing checkpoint representation.
+
 Both vendors consume the same post-convolution activation values in verify
 and save those unnormalized keys for recovery. NVIDIA uses Triton recovery;
 AMD uses Gluon recovery. Neither recomputes the state-dependent correction.

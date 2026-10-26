@@ -18,13 +18,91 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""KDA verify workspace shared by the Kimi-K3 and GLM cache recipes."""
+"""KDA checkpoint fields and transient verify workspace."""
+
+import torch
 
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    cache_dtype_name,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
 )
+
+
+def kda_state_fields(
+    layer_id: int,
+    plane_id: str,
+    *,
+    conv_shape: tuple[int, int],
+    recurrent_shape: tuple[int, int, int],
+    history_capacity: int,
+) -> tuple[CacheFieldSpec, ...]:
+    """Declare a layer's convolution state and recurrent checkpoint.
+
+    Args:
+        layer_id: Model layer owning every field.
+        plane_id: Arena plane that packs this layer's state fields.
+        conv_shape: Per-rank convolution history shape.
+        recurrent_shape: Per-rank (heads, value dimension, key dimension).
+        history_capacity: Total slots shared by accepted history and the
+            current verify candidates. Zero declares only the dense checkpoint.
+            A direct-write consumer must reserve its entire candidate window
+            inside this capacity before verify; it must fit even at length zero.
+
+    Returns:
+        Fields belonging to one scheduler-owned state block. With history,
+        the recurrent field is a dense base. FP32 corrections, normalized
+        keys and multiplicative decays reconstruct its accepted endpoint in
+        token order. The INT32 length publishes only the accepted prefix;
+        candidate writes beyond it do not change the logical checkpoint.
+        Verify writes into a private live page, consolidating the accepted
+        history first when the candidate window would exceed capacity. Commit
+        publishes the accepted length without copying these record fields.
+        The next verify starts at that length, reusing rejected candidate slots.
+        Copying or transferring a checkpoint must carry every field together.
+    """
+    fields = (
+        CacheFieldSpec(
+            f"layer.{layer_id}.conv_state",
+            plane_id,
+            conv_shape,
+            cache_dtype_name(torch.bfloat16),
+            exact_page_stride=False,
+        ),
+        CacheFieldSpec(
+            f"layer.{layer_id}.recurrent_state",
+            plane_id,
+            recurrent_shape,
+            cache_dtype_name(torch.float32),
+            exact_page_stride=False,
+        ),
+    )
+    if history_capacity:
+        heads, value_dim, key_dim = recurrent_shape
+        fields += tuple(
+            CacheFieldSpec(
+                f"layer.{layer_id}.{name}",
+                plane_id,
+                shape,
+                cache_dtype_name(dtype),
+                exact_page_stride=False,
+            )
+            for name, shape, dtype in (
+                (
+                    "replay_correction",
+                    (heads, history_capacity, value_dim),
+                    torch.float32,
+                ),
+                ("replay_key", (heads, history_capacity, key_dim), torch.float32),
+                ("replay_decay", (heads, history_capacity, key_dim), torch.float32),
+                ("replay_length", (1,), torch.int32),
+            )
+        )
+    return fields
 
 
 def kda_replay_supported(config: AttnConfig) -> bool:
@@ -78,7 +156,11 @@ def kda_verify_workspace_bytes(
         return (
             config.max_bs
             * (draft_token_num + 1)
-            * sum(field.payload_bytes for field in state_fields)
+            * sum(
+                field.payload_bytes
+                for field in state_fields
+                if field.field_id.endswith((".conv_state", ".recurrent_state"))
+            )
         )
 
     from tokenspeed_kernel.ops.attention.kda import (

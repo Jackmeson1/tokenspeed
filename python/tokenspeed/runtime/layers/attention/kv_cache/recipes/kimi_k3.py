@@ -45,12 +45,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
     kda_replay_supported,
+    kda_state_fields,
     kda_verify_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
-    cache_dtype_name,
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -248,21 +248,13 @@ class KimiK3Recipe(CacheRecipe):
                 ),
             )
         conv_shape, recurrent_shape = self._kda_shapes
-        return (
-            CacheFieldSpec(
-                f"layer.{layer_id}.conv_state",
-                plane_id,
-                conv_shape,
-                cache_dtype_name(torch.bfloat16),
-                exact_page_stride=False,
-            ),
-            CacheFieldSpec(
-                f"layer.{layer_id}.recurrent_state",
-                plane_id,
-                recurrent_shape,
-                cache_dtype_name(torch.float32),
-                exact_page_stride=False,
-            ),
+        return kda_state_fields(
+            layer_id,
+            plane_id,
+            conv_shape=conv_shape,
+            recurrent_shape=recurrent_shape,
+            # Enable retention only after verify, commit and prefill consume it.
+            history_capacity=0,
         )
 
     # ---- packing: state groups match the MLA plane's byte width ----
