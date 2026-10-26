@@ -55,6 +55,9 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
     iris_fused_lamport_allreduce_muse_attntail,
     iris_fused_pull_allgather_muse_attntail,
 )
+from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
+    iris_fused_gemv_lamport_allgather_muse_moetail,
+)
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_fused_lamport_allreduce_routed_rmsnorm_sum,
     iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
@@ -67,6 +70,11 @@ from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 from tokenspeed_kernel.ops.moe import gather_moe_routes
 from tokenspeed_kernel.platform import current_platform
 
+if current_platform().is_cdna4:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        gluon_rowcta_bf16_gemv_geometry_gfx950,
+    )
+
 _MUSE_BOUNDARY_MAX_ROWS = 26
 _MUSE_WEIGHTED_BOUNDARY_MAX_ROWS = 25
 _MUSE_BOUNDARY_WIDTH = 8192
@@ -74,6 +82,9 @@ _MUSE_BOUNDARY_WIDTH = 8192
 _MUSE_BOUNDARY_SENDERS = 8
 # From this many rows, staggering each sender's peer order spreads link load.
 _MUSE_BOUNDARY_ROTATE_MIN_ROWS = 5
+# Largest row count for the fused routed Lamport when the TP8 Lamport two-shot
+# is prepared; above it, the separate routed norm plus the two-shot is faster.
+_MUSE_ROUTED_LAMPORT_TWO_SHOT_MAX_ROWS = 32
 _MUSE_ROW_BOUNDARY_MIN_ROWS = 512
 _MUSE_OWNED_MIN_ROWS = 192
 _MUSE_ROW_SCATTER_PROGRAMS = 24
@@ -140,6 +151,11 @@ class MuseIrisState:
             all_reduce.producer_pull, enable_lamport=enable_lamport
         )
         self.gather = IrisAllGather(all_reduce.producer)
+        self.routed_lamport_max_rows = (
+            _MUSE_ROUTED_LAMPORT_TWO_SHOT_MAX_ROWS
+            if self.reduction.lamport_two_shot_max_numel
+            else self.reduction.lamport_max_numel // _MUSE_ROUTE_WIDTH
+        )
         peers = all_reduce.peers
         capacity = all_reduce.producer_direct_max_numel
         self.broadcast = IrisBroadcast(peers, capacity) if enable_lamport else None
@@ -232,28 +248,6 @@ class MuseIrisState:
             if reduced.data_ptr() != chunk.data_ptr():
                 chunk.copy_(reduced[: chunk.numel()])
         return tensor
-
-    def can_reduce_borrowed(self, tensor: torch.Tensor) -> bool:
-        """Check the prepared raw-payload reduction without allocating storage."""
-        return (
-            tensor.dtype == self.all_reduce.dtype
-            and tensor.device == self.all_reduce.device
-            and tensor.is_contiguous()
-            and 0 < tensor.numel() <= self.all_reduce.producer_direct_max_numel
-            and tensor.numel() % (self.world_size * 8) == 0
-        )
-
-    def reduce_borrowed(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Reduce ordinary input and borrow the result until the next collective.
-
-        Muse consumes this result on the same stream before a projection or
-        collective can reuse the gather/push buffers. The input need not be
-        symmetric: Lamport and push read it directly; pull stages it once.
-        """
-        if not self.can_reduce_borrowed(tensor):
-            raise ValueError("unsupported Muse borrowed reduction payload")
-        reduced = self.reduction.run(tensor, self.gather.output, tensor.numel())
-        return reduced[: tensor.numel()].view_as(tensor)
 
     def reduce_outputs(
         self, tensors: tuple[torch.Tensor, ...]
@@ -860,6 +854,145 @@ class MuseIrisState:
         )
         return out_stream, pre_fp32, pre_bf16
 
+    def _moetail_geometry(
+        self,
+        rows: int,
+        weight: torch.Tensor,
+        stream: torch.Tensor,
+        post_weight: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        pre_weight: torch.Tensor | None,
+    ) -> tuple[int, int] | None:
+        """Return the senders' GEMV geometry if the fused tail applies, else None."""
+        reduction = self.reduction
+        if (
+            not current_platform().is_cdna4
+            or self.world_size not in (4, 8)
+            or rows != 1
+            or reduction.lamport_region is None
+            or _MUSE_BOUNDARY_WIDTH // self.world_size > reduction.lamport_max_numel
+            or weight.shape != (_MUSE_BOUNDARY_WIDTH, _MUSE_ROUTE_WIDTH)
+            or weight.dtype != torch.bfloat16
+            or weight.device != self.all_reduce.device
+            or not weight.is_contiguous()
+            or stream.shape != (1, _MUSE_BOUNDARY_WIDTH)
+            or stream.dtype != torch.float32
+            or stream.device != weight.device
+            or not stream.is_contiguous()
+        ):
+            return None
+        vectors = [(post_weight, torch.bfloat16), (alpha, torch.float32)]
+        vectors.append((beta, torch.float32))
+        if pre_weight is not None:
+            vectors.append((pre_weight, torch.bfloat16))
+        if not all(
+            value is not None
+            and value.shape == (_MUSE_BOUNDARY_WIDTH,)
+            and value.dtype == dtype
+            and value.device == weight.device
+            and value.is_contiguous()
+            for value, dtype in vectors
+        ):
+            return None
+        # Senders repeat the replicated GEMV's per-output reduction, each
+        # storing an even number of outputs in its 16 subgroups.
+        block_k, waves = gluon_rowcta_bf16_gemv_geometry_gfx950(*weight.shape)
+        if 8 % waves or block_k % (64 * waves) or _MUSE_ROUTE_WIDTH % block_k:
+            return None
+        return block_k, waves
+
+    def can_gemv_all_gather_boundary(
+        self,
+        rows: int,
+        weight: torch.Tensor,
+        stream: torch.Tensor,
+        post_weight: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        pre_weight: torch.Tensor | None,
+    ) -> bool:
+        """Check the single-row post-expert projection, gather and boundary contract.
+
+        ``weight`` is the replicated ``[8192, 4096]`` projection; the row is
+        gathered through the Lamport one-shot mailbox.
+        """
+        return (
+            self._moetail_geometry(
+                rows, weight, stream, post_weight, alpha, beta, pre_weight
+            )
+            is not None
+        )
+
+    def gemv_all_gather_boundary(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        stream: torch.Tensor,
+        post_weight: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        pre_weight: torch.Tensor | None,
+        post_eps: float,
+        post_weight_offset: float,
+        pre_eps: float,
+        pre_weight_offset: float,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Project this rank's columns of one row, gather the row, update the residual.
+
+        Returns the FP32 residual and, with ``pre_weight``, the BF16 input of
+        the next layer, as the replicated single-row projection followed by
+        the Triton boundary computes them.
+        """
+        geometry = self._moetail_geometry(
+            x.shape[0], weight, stream, post_weight, alpha, beta, pre_weight
+        )
+        assert geometry is not None
+        assert x.shape == (1, _MUSE_ROUTE_WIDTH) and x.dtype == torch.bfloat16
+        assert x.is_contiguous() and x.device == weight.device
+        block_k, waves = geometry
+        rank = self.all_reduce.rank_in_group
+        local_width = _MUSE_BOUNDARY_WIDTH // self.world_size
+        reduction = self.reduction
+        out_stream = torch.empty_like(stream)
+        pre_bf16 = (
+            torch.empty(stream.shape, dtype=torch.bfloat16, device=stream.device)
+            if pre_weight is not None
+            else None
+        )
+        # Sixteen-subgroup programs of 16 // waves outputs each, then the reducer.
+        iris_fused_gemv_lamport_allgather_muse_moetail[
+            (local_width * waves // 16 + 1,)
+        ](
+            x,
+            weight[rank * local_width : (rank + 1) * local_width],
+            reduction.lamport_region,
+            reduction.lamport_epochs,
+            reduction.lamport_peer_addresses[: self.world_size],
+            stream,
+            post_weight,
+            alpha,
+            beta,
+            pre_weight if pre_weight is not None else post_weight,
+            out_stream,
+            pre_bf16 if pre_bf16 is not None else x,
+            RANK=rank,
+            WORLD_SIZE=self.world_size,
+            K=_MUSE_ROUTE_WIDTH,
+            LOCAL_WIDTH=local_width,
+            MAX_ELEMENTS=reduction.lamport_max_numel,
+            BLOCK_K=block_k,
+            WAVES_PER_OUTPUT=waves,
+            POST_EPS=post_eps,
+            POST_WEIGHT_OFFSET=post_weight_offset,
+            PRE_EPS=pre_eps,
+            PRE_WEIGHT_OFFSET=pre_weight_offset,
+            HAS_PRE=pre_weight is not None,
+            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+            num_warps=16,
+        )
+        return out_stream, pre_bf16
+
     def can_all_reduce_routed_rmsnorm_sum(
         self,
         routes: torch.Tensor,
@@ -880,7 +1013,7 @@ class MuseIrisState:
             and (
                 num_tokens <= 16
                 or (
-                    num_tokens <= 43
+                    num_tokens <= self.routed_lamport_max_rows
                     and topk == 8
                     and width == 4096
                     and weight_offset == 1.0
