@@ -25,6 +25,14 @@ from collections.abc import Callable
 import torch
 from tokenspeed_kernel_amd._triton import triton
 
+# The large stages leave instruction order to LLVM. Unbounded SLP vectorizer
+# scheduling regroups their scale and epilogue math into long live ranges and
+# costs occupancy: stage 1 goes past 256 registers, and stage 2 loses its
+# third wave on the EP shapes. Stage 1 is fastest at 1000 and loses occupancy
+# again at 3000; stage 2 keeps it only up to 300.
+_PACKED_LARGE_STAGE1_LLVM_CL_OPTS = "slp-schedule-budget=1000"
+_PACKED_LARGE_STAGE2_LLVM_CL_OPTS = "slp-schedule-budget=100"
+
 
 def _packed_schedule(
     num_tokens: int,
@@ -221,7 +229,11 @@ def launch_gluon_fp8_packed_moe_gfx950(
             )
 
             stage1 = gluon_fp8_packed_large_stage1_gfx950
-            stage1_options = {"USE_NT": use_nt, "num_stages": 1}
+            stage1_options = {
+                "USE_NT": use_nt,
+                "num_stages": 1,
+                "llvm_cl_opts": _PACKED_LARGE_STAGE1_LLVM_CL_OPTS,
+            }
         else:
             from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.packed_small import (
                 gluon_fp8_packed_small_stage1_gfx950,
@@ -256,7 +268,11 @@ def launch_gluon_fp8_packed_moe_gfx950(
         )
 
         stage2 = gluon_fp8_packed_large_stage2_gfx950
-        stage2_options = {"USE_NT": use_nt, "num_stages": 1}
+        stage2_options = {
+            "USE_NT": use_nt,
+            "num_stages": 1,
+            "llvm_cl_opts": _PACKED_LARGE_STAGE2_LLVM_CL_OPTS,
+        }
     else:
         from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.packed_small import (
             gluon_fp8_packed_small_stage2_gfx950,
