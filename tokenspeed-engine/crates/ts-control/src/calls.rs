@@ -34,14 +34,13 @@
 //!   never reads success for an option that did nothing.
 //! * `stop_profile()`: stop it and export the traces.
 //!
-//! The RL and weight operations take `[body]`, the JSON body the engine's
-//! SGLang-compatible HTTP route of the same name takes, as a map (`[]` for a
-//! route whose body is optional or absent), and read it with that route's
-//! field names and defaults (`entrypoints/sglang_compat_http.py`), so a
-//! trainer's request means the same over either transport; a key the route
-//! ignores is ignored here too. The engine's control loop then applies its
-//! own rules (the pause modes, the L3 weight-version checks) as it does for
-//! the route's request:
+//! The RL and weight operations take `[body]`, the JSON body of the
+//! SGLang-compatible RL route of the same name (which SMG's `/v1/rl` routes
+//! carry), as a map (`[]` for a route whose body is optional or absent), and
+//! read it with that route's field names and defaults, so a trainer's request
+//! means what it means to an SGLang engine; a key the route ignores is
+//! ignored here too. The engine's control loop then applies its own rules
+//! (the pause modes, the L3 weight-version checks):
 //!
 //! * `pause_generation([{mode = "wait"}])`, `continue_generation()`;
 //! * `init_weights_update_group([{master_address, master_port, rank_offset,

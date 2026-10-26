@@ -63,7 +63,7 @@ from tokenspeed.runtime.utils import (
     nullable_str,
 )
 from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
-from tokenspeed.runtime.utils.network import is_port_available
+from tokenspeed.runtime.utils.network import is_port_available, join_host_port
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     BLOCK_SPEC_RULES,
@@ -4064,8 +4064,13 @@ class ServerArgs:
         return f"http://{self.host}:{self.port}"
 
     def zmq_handshake_endpoint(self) -> str:
-        """The frontend handshake endpoint the engine ranks dial, composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
-        return f"tcp://{self.data_parallel_address}:{self.data_parallel_rpc_port}"
+        """The frontend handshake endpoint the engine ranks dial, composed from
+        ``--data-parallel-address``/``--data-parallel-rpc-port`` (an IPv6
+        address bracketed)."""
+        address = join_host_port(
+            self.data_parallel_address, self.data_parallel_rpc_port
+        )
+        return f"tcp://{address}"
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:

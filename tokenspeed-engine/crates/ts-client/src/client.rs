@@ -38,7 +38,7 @@ use tokio::{
 };
 use tracing::{debug, warn};
 use ts_wire::{
-    frames::{REQUEST_ADD, REQUEST_ENCODE},
+    frames::{REQUEST_ADD, REQUEST_CONTROL, REQUEST_ENCODE},
     output::{FinishDetails, PromptTopLogprobs, TopLogprobs},
     BatchTokenIDOutSlim, ControlOutput, ControlRequest, EncodeRequest, EngineOutput, EngineRequest,
     RequestOutput, StrOrList, TokenizedGenerateReqInput,
@@ -483,8 +483,11 @@ impl EngineClient {
     /// Run a control operation on every engine and return their replies,
     /// one per engine, in arrival order. Operations of one kind run one at
     /// a time; some (a `wait` pause, a weight load) answer only when done,
-    /// so callers bound the wait themselves.
+    /// so callers bound the wait themselves. An engine that takes no control
+    /// operations (an EPD encode server) refuses the call before it is sent:
+    /// it would answer none.
     pub async fn control(&self, request: ControlRequest) -> Result<Vec<ControlOutput>> {
+        self.shared.require(REQUEST_CONTROL)?;
         let tag = request.reply_tag();
         let turn = lock(&self.shared.control_turns)
             .entry(tag)

@@ -1343,12 +1343,14 @@ async fn start_ranks_with(
                 let frontend = || {
                     (rank % tp_size == 0).then(|| {
                         let engine_index = (rank / tp_size) as u16;
-                        let ready = EngineCoreReadyResponse {
+                        let mut ready = EngineCoreReadyResponse {
                             max_model_len: 4096,
                             data_parallel_size: num_engines as i64,
                             data_parallel_rank: i64::from(engine_index),
                             ..Default::default()
                         };
+                        // As `ts-host` registers a scheduler.
+                        ready.declare_scheduler();
                         EngineTransport::connect(
                             &handshake,
                             engine_index,

@@ -101,7 +101,7 @@ def _run_launcher(workers, server_args, path, writer):
 
     started = []
 
-    def start_without_model(server_args, port_args, metrics_relay):
+    def start_without_model(server_args, port_args, metrics_relay, parent_death_signal):
         # Replace GPU/model loading only: the launcher's supervision, signal
         # handlers and process-tree shutdown are the real implementation.
         for target, args in workers:

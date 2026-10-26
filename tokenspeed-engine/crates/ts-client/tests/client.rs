@@ -423,6 +423,21 @@ async fn an_encode_server_takes_encode_requests_and_nothing_else() {
         panic!("an encode server takes no generate request");
     };
     assert!(matches!(error, Error::InvalidRequest(_)), "{error}");
+    // Nor a control operation, which it would never answer: the call is
+    // refused at once instead of waiting for a reply.
+    let control = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.control(ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })),
+    )
+    .await
+    .expect("refused before any wait");
+    assert!(
+        matches!(control, Err(Error::InvalidRequest(_))),
+        "{control:?}"
+    );
 }
 
 #[tokio::test]

@@ -174,7 +174,7 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     bootstrap_host: str | None = None
     bootstrap_port: int | None = None
     # Checkpoint facts a frontend computes multimodal items' MRoPE positions
-    # from (``multimodal/mrope.py``'s ``mrope_facts``).
+    # from (``multimodal/mrope_facts.py``'s ``mrope_facts``).
     model_type: str | None = None
     architectures: list[str] = msgspec.field(default_factory=list)
     mrope_positions: bool | None = None

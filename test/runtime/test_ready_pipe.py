@@ -104,7 +104,7 @@ def _launcher_owns_failed_startup_cleanup(writer):
     finish_cleanup = mp.Event()
     started = []
 
-    def start_without_model(server_args, port_args, metrics_relay):
+    def start_without_model(server_args, port_args, metrics_relay, parent_death_signal):
         # Replace GPU/model loading only: the launcher's ready wait and
         # process-tree shutdown are the real implementation.
         started.extend(
