@@ -92,6 +92,20 @@ fn normalize(params: &mut SamplingParams) {
     params.is_normalized = true;
 }
 
+/// `_can_stop_early()`: whether the request can finish before its length
+/// budget. `ignore_eos` also disables stop token ids.
+fn can_stop_early(p: &SamplingParams) -> bool {
+    let has_stop_strs = match &p.stop_strs {
+        None => false,
+        Some(StrOrList::One(_)) => true,
+        Some(StrOrList::Many(stops)) => !stops.is_empty(),
+    };
+    let has_grammar = [&p.json_schema, &p.regex, &p.ebnf, &p.structural_tag]
+        .iter()
+        .any(|g| g.is_some());
+    !p.ignore_eos || has_stop_strs || has_grammar
+}
+
 /// `verify(vocab_size)`: the reason the parameters are invalid, if they are.
 pub fn verify(params: &SamplingParams, vocab_size: i64) -> Result<(), String> {
     let p = params;
@@ -155,6 +169,15 @@ pub fn verify(params: &SamplingParams, vocab_size: i64) -> Result<(), String> {
                 p.min_new_tokens
             ));
         }
+    }
+    if p.min_new_tokens > 0 && can_stop_early(p) {
+        // No finish check or sampling backend enforces the minimum;
+        // reject stopping settings that could end generation early.
+        return Err(format!(
+            "min_new_tokens={} is only supported with ignore_eos=True and no stop strings \
+             or grammar (json_schema, regex, ebnf, structural_tag); use min_new_tokens=0.",
+            p.min_new_tokens
+        ));
     }
     if let Some(bias) = &p.logit_bias {
         for (token_id, _) in &bias.0 {

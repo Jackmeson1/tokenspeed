@@ -633,6 +633,7 @@ mod tests {
         let params = SamplingParams {
             max_new_tokens: Some(50),
             min_new_tokens: 20,
+            ignore_eos: true,
             ..Default::default()
         };
         let Some(Admitted::Run(admission)) = admit(request("r1", vec![0; 90], params), &limits())

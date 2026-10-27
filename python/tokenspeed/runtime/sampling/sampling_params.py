@@ -53,6 +53,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     ``is_normalized`` guard keeps a decode from re-deriving fields that
     ``normalize()`` already resolved on the sending process.
 
+    Positive ``min_new_tokens`` requires ``ignore_eos=True`` and no stop
+    strings or grammar. It does not add minimum-length enforcement: context
+    clamping can leave a smaller generation budget, and cancellation or
+    failure can end a request below the minimum.
+
     See docs/backend/sampling_params.md or
     https://docs.tokenspeed.ai/backend/sampling_params.html
     for the documentation.
@@ -173,6 +178,14 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
+        if self.min_new_tokens > 0 and self._can_stop_early():
+            # No finish check or sampling backend enforces the minimum;
+            # reject stopping settings that could end generation early.
+            raise ValueError(
+                f"min_new_tokens={self.min_new_tokens} is only supported with "
+                "ignore_eos=True and no stop strings or grammar "
+                "(json_schema, regex, ebnf, structural_tag); use min_new_tokens=0."
+            )
         if self.logit_bias is not None:
             for token_id in self.logit_bias:
                 if not 0 <= int(token_id) < vocab_size:
@@ -196,6 +209,19 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+
+    def _can_stop_early(self) -> bool:
+        """Whether the request can finish before its length budget.
+
+        ``ignore_eos`` also disables stop token IDs. ``stop_strs`` is still the
+        raw ``stop`` value before ``normalize()``, where ``""`` is one stop string.
+        """
+        has_stop_strs = isinstance(self.stop_strs, str) or bool(self.stop_strs)
+        has_grammar = any(
+            g is not None
+            for g in (self.json_schema, self.regex, self.ebnf, self.structural_tag)
+        )
+        return not self.ignore_eos or has_stop_strs or has_grammar
 
     def requested_features(self) -> "set[str]":
         """Return the set of backend-facing feature names this request needs.

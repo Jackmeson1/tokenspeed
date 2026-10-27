@@ -60,3 +60,62 @@ def test_min_p_stays_inclusive_at_zero():
     # this file: min_p=0 is valid and must keep passing.
     SamplingParams(min_p=0.0).verify(vocab_size=32)
     SamplingParams(min_p=1.0).verify(vocab_size=32)
+
+
+# ``min_new_tokens`` is not enforced by any finish check or sampling backend,
+# so a positive minimum is only accepted where the request cannot end before
+# its length budget.
+
+
+def test_min_new_tokens_rejected_when_eos_can_end_the_request():
+    for params in (
+        SamplingParams(min_new_tokens=5),
+        SamplingParams(min_new_tokens=5, max_new_tokens=16),
+    ):
+        with pytest.raises(ValueError, match=r"min_new_tokens=5 is only supported"):
+            params.verify(vocab_size=32)
+
+
+@pytest.mark.parametrize(
+    "stop_or_grammar",
+    [
+        {"stop": "x"},
+        {"stop": ""},
+        {"stop": ["x", "y"]},
+        {"json_schema": "{}"},
+        {"regex": "a+"},
+        {"ebnf": 'root ::= "a"'},
+        {"structural_tag": "{}"},
+    ],
+)
+def test_min_new_tokens_rejected_when_a_stop_or_grammar_can_end_the_request(
+    stop_or_grammar,
+):
+    params = SamplingParams(min_new_tokens=5, ignore_eos=True, **stop_or_grammar)
+    with pytest.raises(ValueError, match=r"min_new_tokens=5 is only supported"):
+        params.verify(vocab_size=32)
+    # Same verdict after normalize(), the order the engine applies them in.
+    params.normalize(tokenizer=None)
+    with pytest.raises(ValueError, match=r"min_new_tokens=5 is only supported"):
+        params.verify(vocab_size=32)
+
+
+def test_min_new_tokens_accepted_when_only_length_can_end_the_request():
+    # The shape of the evalscope perf configs: ignore_eos with min == max.
+    SamplingParams(min_new_tokens=1024, max_new_tokens=1024, ignore_eos=True).verify(
+        vocab_size=32
+    )
+    SamplingParams(min_new_tokens=5, ignore_eos=True, stop=[]).verify(vocab_size=32)
+    params = SamplingParams(min_new_tokens=5, ignore_eos=True, stop_token_ids={3})
+    params.normalize(tokenizer=None)
+    params.verify(vocab_size=32)
+
+
+def test_min_new_tokens_default_and_range_checks_unchanged():
+    SamplingParams().verify(vocab_size=32)
+    with pytest.raises(ValueError, match=r"min_new_tokens must be in"):
+        SamplingParams(min_new_tokens=-1).verify(vocab_size=32)
+    with pytest.raises(ValueError, match=r"min_new_tokens must be in"):
+        SamplingParams(min_new_tokens=3, max_new_tokens=2, ignore_eos=True).verify(
+            vocab_size=32
+        )
